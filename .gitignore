@@ -4,6 +4,3 @@ __pycache__/
 venv/
 .env
 *.db
-# Rendered by scripts/render-source-configmap.sh; regenerate rather than review.
-deploy/overlays/live/source-configmap.yaml
-deploy/overlays/live/static-configmap.yaml

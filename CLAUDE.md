@@ -1,12 +1,17 @@
 # home-harness — notes for Claude
 
-LLM-agnostic agent harness on the home k3d cluster. Voice + Home Assistant +
-Google Calendar.
+LLM-agnostic agent harness. Voice + Home Assistant + Google Calendar.
+
+**This repo builds the harness; it does not deploy it.** Kubernetes manifests,
+ingress, storage, secrets and the live `models.yaml` live in
+`Franion03/arr-stack` under `apps/harness/`, synced by the `arr-stack-root`
+ArgoCD Application. Do not add deployment YAML here — that split is deliberate.
+CI publishes `ghcr.io/franion03/home-harness:latest` on every push to `master`.
 
 ## The invariant that matters
 
 **No vendor or model name may appear outside `harness/app/provider_*.py`,
-`llm.py`'s `build_registry()`, and `deploy/base/models.yaml`.**
+`llm.py`'s `build_registry()`, and `models.yaml`.**
 
 If a change would put `claude`, `gpt`, `gemini`, an `anthropic.` import or a
 vendor URL into `agent.py`, `main.py`, `tool_*.py` or `speech.py`, it is the
@@ -47,22 +52,24 @@ wrong change. Add or extend an adapter instead. The canonical vocabulary is in
 
 ## Conventions
 
-- Flat module layout in `harness/app/` on purpose: ConfigMap keys cannot
-  contain `/`, and the `live` overlay mounts the source directly. Do not
-  reorganise into subpackages without also dropping that overlay.
+- Flat module layout in `harness/app/` on purpose: it keeps every module one
+  hop from `main.py` and lets the whole app be mounted from a ConfigMap if a
+  registry is ever unavailable. Imports are bare (`from config import ...`),
+  so a nested package would break every one of them.
 - Dependencies stay at fastapi + uvicorn + httpx + pydantic + PyYAML +
   python-multipart. Google Calendar is raw REST specifically to avoid
   `google-api-python-client`.
 - Tests are standard-library `unittest`, no network, no keys:
   `python harness/tests/test_harness.py`.
-- After editing anything under `harness/`, re-run
-  `scripts/render-source-configmap.sh` before `kubectl apply -k deploy/overlays/live`.
+- `harness/models.example.yaml` documents the routing format. The copy that
+  actually runs is `apps/harness/models.yaml` in arr-stack; keep them in step
+  when the format changes.
 
-## Cluster facts
+## Where it runs (for context — none of this is configured here)
 
 - Server `192.168.1.114`, k3d cluster `arr-cluster`, context `k3d-arr-cluster`.
 - Namespace `assistant`. Ingress `assistant.192.168.1.114.nip.io`, class nginx.
 - Home Assistant is a **separate box at `192.168.1.117:8123`**, not in the
   cluster.
-- sealed-secrets controller is in `kube-system` (shared with arr-stack).
 - The PVC is `local-path` RWO, so the Deployment strategy must stay `Recreate`.
+- All of the above is defined in arr-stack `apps/harness/`, not here.

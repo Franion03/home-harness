@@ -151,7 +151,7 @@ def main() -> int:
     print(f"  GOOGLE_CLIENT_ID={args.client_id}")
     print(f"  GOOGLE_CLIENT_SECRET={args.client_secret}")
     print(f"  GOOGLE_REFRESH_TOKEN={refresh}")
-    print("\nThen:  scripts/create-secrets.sh   (or seal-secrets.sh for GitOps)")
+    print("\nThen put them in the deployment secret: arr-stack scripts/create-harness-secret.sh")
     print("=" * 68)
     return 0
 

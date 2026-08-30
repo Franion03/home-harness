@@ -1,26 +1,34 @@
 # home-harness
 
-An agent harness for the home server that does not depend on which LLM you plug
-into it. Talk to it by voice from a phone or a laptop; it controls Home
-Assistant and manages Google Calendar.
+An agent harness that does not depend on which LLM you plug into it. Talk to it
+by voice from a phone or a laptop; it controls Home Assistant and manages
+Google Calendar.
 
-Runs on the same k3d cluster as [arr-stack](https://github.com/Franion03/arr-stack),
-managed by the same ArgoCD, with secrets sealed by the same controller.
+**This repo builds the harness. It does not deploy it.** Deployment lives in
+[arr-stack/apps/harness](https://github.com/Franion03/arr-stack/tree/master/apps/harness),
+which ArgoCD syncs onto the home cluster.
+
+| Concern | Where |
+|---|---|
+| Python source, Dockerfile, tests, CI image build | here |
+| Manifests, ingress, storage, secrets, live `models.yaml` | `Franion03/arr-stack` → `apps/harness/` |
+
+CI publishes `ghcr.io/franion03/home-harness:latest` on every push to `master`.
 
 ```
   phone / laptop (PWA)
           │  HTTPS — hold to talk
           ▼
   ┌───────────────────────────────────────────┐
-  │  harness  (namespace: assistant)          │
+  │  harness                                  │
   │                                           │
   │   FastAPI  ─ /v1/chat  /v1/voice          │
   │      │                                    │
-  │   agent loop ── tools ──┬── Home Assistant│──▶ 192.168.1.117:8123
+  │   agent loop ── tools ──┬── Home Assistant│──▶ HA REST API
   │      │                  └── Google Calendar│──▶ Calendar API v3
   │      │                                    │
   │   router ── route → primary, fallback     │
-  │      │      (from models.yaml ConfigMap)  │
+  │      │      (from models.yaml)            │
   │      ▼                                    │
   │   adapters: anthropic │ openai │ google   │
   └──────────┬────────────────────────────────┘
@@ -38,8 +46,8 @@ The agent loop, the tools and the API all speak one canonical vocabulary —
 `provider_base.py`. Each adapter's only job is translating that to and from one
 vendor's wire format.
 
-Which model answers lives in **`deploy/base/models.yaml`**, mounted as a
-ConfigMap. Changing your mind about the LLM looks like this:
+Which model answers lives in **`models.yaml`** (see `harness/models.example.yaml`;
+the live copy is in arr-stack), mounted as a ConfigMap:
 
 ```yaml
 routes:
@@ -48,19 +56,13 @@ routes:
     fallback: openai/gpt-4o
 ```
 
-```bash
-kubectl -n assistant rollout restart deploy/harness
-# or, with no restart at all:
-curl -XPOST -H "X-API-Key: $KEY" http://assistant.192.168.1.114.nip.io/v1/admin/reload
-```
+No code change, no rebuild, no new image. The same applies to speech: `stt:`
+and `tts:` are model references with fallbacks, exactly like the chat routes.
 
-No code change, no rebuild, no redeploy. The same applies to speech: `stt:` and
-`tts:` are model references with fallbacks, exactly like the chat routes.
-
-Adding a vendor that nobody has written an adapter for yet is one file plus one
-line in `build_registry()`. If it speaks `/v1/chat/completions`, it is just a
-line — `provider_openai.py` already covers OpenAI, OpenRouter, Groq, Mistral,
-DeepSeek and Cloudflare Workers AI.
+Adding a vendor nobody has written an adapter for is one file plus one line in
+`build_registry()`. If it speaks `/v1/chat/completions`, it is just the line —
+`provider_openai.py` already covers OpenAI, OpenRouter, Groq, Mistral, DeepSeek
+and Cloudflare Workers AI.
 
 **Fallbacks are for availability, not cost.** When the primary rate-limits or
 5xxs, the route's fallback answers, so the house keeps working through a vendor
@@ -70,7 +72,7 @@ non-retryable — a malformed request would fail identically on the fallback.
 ## Layout
 
 ```
-harness/app/               flat modules — same source runs from an image or a ConfigMap
+harness/app/               flat modules — deliberately not a nested package
   provider_base.py         canonical types every layer above speaks
   provider_anthropic.py    native Messages API (tool use, thinking, effort)
   provider_openai.py       /v1/chat/completions — 6 vendors, one adapter
@@ -80,17 +82,15 @@ harness/app/               flat modules — same source runs from an image or a 
   agent.py                 the tool loop
   tool_registry.py         JSON Schema tool descriptions + dispatch
   tool_homeassistant.py    entities, states, services, HA's own intent engine
-  tool_calendar.py         Calendar API v3 over plain HTTPS
+  tool_calendar.py         Calendar API v3 over raw REST
   google_auth.py           refresh token → access token
   speech.py                STT and TTS, same route-and-fallback pattern
-  memory.py                per-session history in SQLite on the PVC
+  memory.py                per-session history in SQLite
   main.py                  FastAPI surface
   static/                  the voice PWA
 harness/tests/             28 tests, standard library only
-deploy/base/               kustomize base + models.yaml
-deploy/overlays/ghcr/      production: image from GHCR   ← ArgoCD points here
-deploy/overlays/live/      registry-free: source from ConfigMaps
-scripts/                   OAuth consent, secrets, ConfigMap rendering
+harness/models.example.yaml  routing config reference
+scripts/google_oauth.py    one-time Google consent → refresh token
 ```
 
 ## API
@@ -110,63 +110,29 @@ scripts/                   OAuth consent, secrets, ConfigMap rendering
 Everything except `/health` and the PWA requires `X-API-Key` (or
 `Authorization: Bearer`) matching `HARNESS_API_KEY`.
 
-## Deploying
-
-### Registry-free (what is running now)
-
-Runs a stock `python:3.12-slim` with the source mounted from ConfigMaps, so it
-works before any image exists.
+## Running it locally
 
 ```bash
-scripts/render-source-configmap.sh    # re-run after any change under harness/
-kubectl apply -k deploy/overlays/live
+cp .env.example .env          # fill in at least one vendor key
+set -a && . ./.env && set +a
+pip install -r harness/requirements.txt
+cd harness/app && uvicorn main:app --reload --port 8080
 ```
 
-### GitOps (the target state)
+Then open http://localhost:8080. `localhost` is a secure context, so the
+microphone works without HTTPS.
+
+## Google Calendar
+
+A service account cannot reach a personal calendar, so the harness uses a user
+refresh token. Once, on a machine with a browser:
 
 ```bash
-git remote add origin git@github.com:Franion03/home-harness.git
-git push -u origin master           # GH Actions builds and pushes to GHCR
-kubectl apply -f argocd/application.yaml
+python3 scripts/google_oauth.py --client-id ... --client-secret ...
 ```
 
-ArgoCD then owns the `assistant` namespace with `prune` and `selfHeal`, the
-same as `arr-stack-root`.
-
-### Secrets
-
-Local bootstrap:
-
-```bash
-export ANTHROPIC_API_KEY=... OPENAI_API_KEY=... HA_TOKEN=...
-scripts/create-secrets.sh
-kubectl -n assistant rollout restart deploy/harness
-```
-
-GitOps: put the same values in GitHub Secrets and run the **Seal Secrets**
-workflow — identical pipeline to arr-stack. `scripts/seal-secrets.sh` does the
-same thing from your shell.
-
-`/health` reports which integrations came up, so a missing credential is
-visible rather than silent.
-
-## Voice from a phone
-
-The PWA uses `MediaRecorder`, which browsers only expose in a **secure
-context**. Over `http://assistant.192.168.1.114.nip.io` the microphone will be
-blocked and the page says so; typing still works.
-
-Give it HTTPS by adding a hostname to the cloudflared tunnel already running in
-the `media` namespace — Cloudflare Zero Trust → Networks → Tunnels → your
-tunnel → Public Hostname:
-
-```
-  assistant.<your-domain>  →  http://harness.assistant.svc.cluster.local:80
-```
-
-Put a Cloudflare Access policy in front of it, then open the URL on the phone
-and *Add to Home Screen*. Hold the big button to talk; on a laptop, hold the
-space bar.
+It prints the three values to put into the deployment secret. Setup steps for
+the Google Cloud side are in the script's docstring.
 
 ## Tests
 
