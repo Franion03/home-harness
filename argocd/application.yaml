@@ -1,0 +1,27 @@
+# Apply once, by hand, exactly like arr-stack's argocd/root.yaml:
+#     kubectl apply -f argocd/application.yaml
+# After that ArgoCD owns the namespace and every push to master deploys itself.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: home-harness
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Franion03/home-harness.git
+    targetRevision: HEAD
+    # Switch to deploy/overlays/live if you ever need to run without a
+    # container registry again.
+    path: deploy/overlays/ghcr
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: assistant
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

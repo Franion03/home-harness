@@ -1,0 +1,267 @@
+"""Google Calendar tools -- Calendar API v3 over plain HTTPS.
+
+Raw REST rather than the google-api-python-client so the image stays small and
+the dependency set is httpx + fastapi. Auth is a user refresh token, which is
+the only way to reach a personal calendar.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from datetime import datetime, timedelta
+from urllib.parse import quote
+from zoneinfo import ZoneInfo
+
+import httpx
+
+from google_auth import GoogleAuth
+from tool_registry import ToolRegistry, integer, obj, string
+
+log = logging.getLogger("harness.tools.calendar")
+
+API = "https://www.googleapis.com/calendar/v3"
+
+
+class Calendar:
+    def __init__(self, auth: GoogleAuth, default_calendar: str, timezone: str):
+        self._auth = auth
+        self._default = default_calendar or "primary"
+        self._tz = timezone
+        self._client = httpx.AsyncClient(timeout=25.0)
+
+    @property
+    def configured(self) -> bool:
+        return self._auth.configured
+
+    async def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {await self._auth.token()}",
+            "Content-Type": "application/json",
+        }
+
+    def _now(self) -> datetime:
+        return datetime.now(ZoneInfo(self._tz))
+
+    async def _request(self, method: str, path: str, **kw) -> dict:
+        resp = await self._client.request(
+            method, f"{API}{path}", headers=await self._headers(), **kw
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"Google Calendar {method} {path} -> {resp.status_code}: {resp.text[:250]}"
+            )
+        return resp.json() if resp.content else {}
+
+    # ---- tool implementations -----------------------------------------
+
+    async def list_calendars(self) -> str:
+        data = await self._request("GET", "/users/me/calendarList")
+        rows = [
+            {
+                "id": c.get("id"),
+                "name": c.get("summary"),
+                "primary": bool(c.get("primary")),
+                "access": c.get("accessRole"),
+            }
+            for c in data.get("items", [])
+        ]
+        return json.dumps(rows, ensure_ascii=False)
+
+    async def list_events(
+        self,
+        days_ahead: int = 7,
+        time_min: str = "",
+        time_max: str = "",
+        query: str = "",
+        calendar_id: str = "",
+        max_results: int = 25,
+    ) -> str:
+        now = self._now()
+        start = time_min or now.isoformat()
+        end = time_max or (now + timedelta(days=max(1, days_ahead))).isoformat()
+
+        params = {
+            "timeMin": start,
+            "timeMax": end,
+            "singleEvents": "true",
+            "orderBy": "startTime",
+            "maxResults": str(min(max(1, max_results), 100)),
+            "timeZone": self._tz,
+        }
+        if query:
+            params["q"] = query
+
+        data = await self._request(
+            "GET", f"/calendars/{self._cal(calendar_id)}/events", params=params
+        )
+        events = [self._summarise(e) for e in data.get("items", [])]
+        if not events:
+            return f"No events between {start} and {end}."
+        return json.dumps(events, ensure_ascii=False)
+
+    async def create_event(
+        self,
+        summary: str,
+        start: str,
+        end: str = "",
+        description: str = "",
+        location: str = "",
+        all_day: str = "",
+        calendar_id: str = "",
+    ) -> str:
+        body: dict = {"summary": summary}
+        if description:
+            body["description"] = description
+        if location:
+            body["location"] = location
+
+        if all_day.lower() in ("true", "yes", "1"):
+            body["start"] = {"date": start[:10]}
+            body["end"] = {"date": (end or start)[:10]}
+        else:
+            if not end:
+                # Default to a one-hour meeting rather than rejecting the call.
+                end = (datetime.fromisoformat(start) + timedelta(hours=1)).isoformat()
+            body["start"] = {"dateTime": start, "timeZone": self._tz}
+            body["end"] = {"dateTime": end, "timeZone": self._tz}
+
+        data = await self._request(
+            "POST", f"/calendars/{self._cal(calendar_id)}/events", json=body
+        )
+        return f"Created '{data.get('summary')}' (id {data.get('id')}) — {self._when(data)}"
+
+    async def update_event(
+        self,
+        event_id: str,
+        summary: str = "",
+        start: str = "",
+        end: str = "",
+        description: str = "",
+        location: str = "",
+        calendar_id: str = "",
+    ) -> str:
+        cal = self._cal(calendar_id)
+        patch: dict = {}
+        if summary:
+            patch["summary"] = summary
+        if description:
+            patch["description"] = description
+        if location:
+            patch["location"] = location
+        if start:
+            patch["start"] = {"dateTime": start, "timeZone": self._tz}
+        if end:
+            patch["end"] = {"dateTime": end, "timeZone": self._tz}
+        if not patch:
+            return "Nothing to update — provide at least one field to change."
+
+        data = await self._request("PATCH", f"/calendars/{cal}/events/{event_id}", json=patch)
+        return f"Updated '{data.get('summary')}' — {self._when(data)}"
+
+    async def delete_event(self, event_id: str, calendar_id: str = "") -> str:
+        await self._request(
+            "DELETE", f"/calendars/{self._cal(calendar_id)}/events/{event_id}"
+        )
+        return f"Deleted event {event_id}."
+
+    # ---- helpers -------------------------------------------------------
+
+    def _cal(self, calendar_id: str) -> str:
+        # Calendar ids are usually email addresses; the '@' must be encoded
+        # because it lands in a path segment.
+        return quote(calendar_id or self._default, safe="")
+
+    @staticmethod
+    def _when(event: dict) -> str:
+        start = event.get("start") or {}
+        return start.get("dateTime") or start.get("date") or "unknown time"
+
+    @staticmethod
+    def _summarise(event: dict) -> dict:
+        start = event.get("start") or {}
+        end = event.get("end") or {}
+        return {
+            "id": event.get("id"),
+            "summary": event.get("summary", "(no title)"),
+            "start": start.get("dateTime") or start.get("date"),
+            "end": end.get("dateTime") or end.get("date"),
+            "location": event.get("location"),
+            "all_day": "date" in start,
+        }
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+
+def register(registry: ToolRegistry, cal: Calendar) -> None:
+    registry.add(
+        "calendar_list_events",
+        "List events from Google Calendar. Use this to answer anything about "
+        "what is scheduled, when someone is free, or what is coming up.",
+        obj(
+            {
+                "days_ahead": integer("How many days forward to look. Default 7."),
+                "time_min": string("ISO 8601 start of the window. Overrides days_ahead."),
+                "time_max": string("ISO 8601 end of the window. Overrides days_ahead."),
+                "query": string("Free-text search over event titles and descriptions."),
+                "calendar_id": string("Calendar id. Defaults to the primary calendar."),
+                "max_results": integer("Maximum events to return, 1-100. Default 25."),
+            }
+        ),
+        cal.list_events,
+    )
+    registry.add(
+        "calendar_create_event",
+        "Create a new event on Google Calendar. Resolve relative dates like "
+        "'tomorrow at 6' into a full ISO 8601 datetime before calling.",
+        obj(
+            {
+                "summary": string("Event title."),
+                "start": string("ISO 8601 start, e.g. '2026-09-02T18:00:00'."),
+                "end": string("ISO 8601 end. Defaults to one hour after start."),
+                "description": string("Longer notes for the event."),
+                "location": string("Where the event happens."),
+                "all_day": string("'true' for an all-day event; start/end are dates."),
+                "calendar_id": string("Calendar id. Defaults to the primary calendar."),
+            },
+            ["summary", "start"],
+        ),
+        cal.create_event,
+    )
+    registry.add(
+        "calendar_update_event",
+        "Change an existing calendar event. Only the fields you pass are "
+        "modified. Get the event_id from calendar_list_events first.",
+        obj(
+            {
+                "event_id": string("Id of the event to change."),
+                "summary": string("New title."),
+                "start": string("New ISO 8601 start."),
+                "end": string("New ISO 8601 end."),
+                "description": string("New description."),
+                "location": string("New location."),
+                "calendar_id": string("Calendar id. Defaults to the primary calendar."),
+            },
+            ["event_id"],
+        ),
+        cal.update_event,
+    )
+    registry.add(
+        "calendar_delete_event",
+        "Delete a calendar event. Confirm with the user before calling this.",
+        obj(
+            {
+                "event_id": string("Id of the event to delete."),
+                "calendar_id": string("Calendar id. Defaults to the primary calendar."),
+            },
+            ["event_id"],
+        ),
+        cal.delete_event,
+    )
+    registry.add(
+        "calendar_list_calendars",
+        "List all calendars this account can see, with their ids.",
+        obj({}),
+        cal.list_calendars,
+    )

@@ -1,0 +1,24 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: harness
+  namespace: assistant
+  annotations:
+    ingress.kubernetes.io/ssl-redirect: "false"
+    # Voice uploads are multipart audio; the 1m nginx default is plenty but
+    # explicit beats surprising.
+    nginx.ingress.kubernetes.io/proxy-body-size: "25m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "180"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: assistant.192.168.1.114.nip.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: harness
+                port:
+                  number: 80

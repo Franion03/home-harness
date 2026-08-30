@@ -1,0 +1,13 @@
+# Production shape: the image is built by .github/workflows/build.yml and
+# pulled from GHCR. This is what the ArgoCD Application points at.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: assistant
+
+resources:
+  - ../../base
+
+images:
+  - name: ghcr.io/franion03/home-harness
+    newTag: latest

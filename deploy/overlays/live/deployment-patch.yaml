@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: harness
+  namespace: assistant
+spec:
+  template:
+    spec:
+      containers:
+        - name: harness
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          workingDir: /app
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              # --target keeps the install inside a writable emptyDir so the
+              # container can still run as a non-root user.
+              if [ ! -f /deps/.installed ]; then
+                echo "installing dependencies..."
+                pip install --quiet --no-cache-dir --target /deps -r /app/requirements.txt
+                touch /deps/.installed
+              fi
+              exec python -m uvicorn main:app --host 0.0.0.0 --port 8080
+          env:
+            - name: PYTHONPATH
+              value: /deps
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: PATH
+              value: /deps/bin:/usr/local/bin:/usr/bin:/bin
+          volumeMounts:
+            - name: source
+              mountPath: /app
+              readOnly: true
+            - name: static
+              mountPath: /app/static
+              readOnly: true
+            - name: deps
+              mountPath: /deps
+          # Dependency install adds ~30s to a cold start.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+      volumes:
+        - name: source
+          configMap:
+            name: harness-source
+        - name: static
+          configMap:
+            name: harness-static
+        - name: deps
+          emptyDir: {}
