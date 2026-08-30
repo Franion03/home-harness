@@ -13,7 +13,6 @@ from typing import Any
 
 import httpx
 
-from tool_registry import ToolRegistry, boolean, obj, string
 
 log = logging.getLogger("harness.tools.ha")
 
@@ -27,13 +26,20 @@ INTERESTING_DOMAINS = (
 
 
 class HomeAssistant:
-    def __init__(self, base_url: str, token: str, *, timeout: float = 20.0):
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        *,
+        timeout: float = 20.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self._headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
-        self._client = httpx.AsyncClient(timeout=timeout)
+        self._client = httpx.AsyncClient(timeout=timeout, transport=transport)
 
     @property
     def configured(self) -> bool:
@@ -99,19 +105,26 @@ class HomeAssistant:
         )
 
     async def call_service(
-        self, domain: str, service: str, entity_id: str = "", data: str = ""
+        self,
+        domain: str,
+        service: str,
+        entity_id: str = "",
+        data: dict[str, Any] | str | None = None,
     ) -> str:
         payload: dict[str, Any] = {}
         if entity_id:
             payload["entity_id"] = entity_id
-        if data:
+        # FastAPI hands us a dict; a hand-written call may still pass a JSON
+        # string, so both are accepted.
+        if isinstance(data, str) and data.strip():
             try:
-                extra = json.loads(data)
+                data = json.loads(data)
             except json.JSONDecodeError:
                 return f"`data` must be a JSON object, got: {data[:120]}"
-            if not isinstance(extra, dict):
+        if data:
+            if not isinstance(data, dict):
                 return "`data` must be a JSON object."
-            payload.update(extra)
+            payload.update(data)
 
         result = await self._post(f"/api/services/{domain}/{service}", payload)
         changed = [
@@ -139,52 +152,3 @@ class HomeAssistant:
 
     async def aclose(self) -> None:
         await self._client.aclose()
-
-
-def register(registry: ToolRegistry, ha: HomeAssistant) -> None:
-    registry.add(
-        "ha_list_entities",
-        "List Home Assistant entities with their current state. Call this first "
-        "when you do not already know the exact entity_id. Filter by domain "
-        "(light, switch, climate, sensor, cover, lock, media_player, scene, ...) "
-        "or by a search word matching the name.",
-        obj(
-            {
-                "domain": string("Restrict to one domain, e.g. 'light'.", default=""),
-                "search": string("Case-insensitive substring of the name or id."),
-            }
-        ),
-        ha.list_entities,
-    )
-    registry.add(
-        "ha_get_state",
-        "Get the full current state and attributes of one Home Assistant entity.",
-        obj({"entity_id": string("Exact entity id, e.g. 'light.kitchen'.")}, ["entity_id"]),
-        ha.get_state,
-    )
-    registry.add(
-        "ha_call_service",
-        "Call a Home Assistant service to change something: turn devices on or "
-        "off, set brightness or temperature, open covers, run scenes or scripts.",
-        obj(
-            {
-                "domain": string("Service domain, e.g. 'light', 'climate', 'scene'."),
-                "service": string("Service name, e.g. 'turn_on', 'set_temperature'."),
-                "entity_id": string("Target entity id. Omit for services that need no target."),
-                "data": string(
-                    "Extra service parameters as a JSON object string, e.g. "
-                    '\'{"brightness_pct": 40}\' or \'{"temperature": 21}\'.'
-                ),
-            },
-            ["domain", "service"],
-        ),
-        ha.call_service,
-    )
-    registry.add(
-        "ha_conversation",
-        "Send a natural-language phrase to Home Assistant's own built-in intent "
-        "engine. Use this for area-wide commands ('turn off everything "
-        "downstairs') or custom sentences configured in Home Assistant.",
-        obj({"text": string("The phrase to hand to Home Assistant.")}, ["text"]),
-        ha.conversation,
-    )

@@ -16,7 +16,6 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from google_auth import GoogleAuth
-from tool_registry import ToolRegistry, integer, obj, string
 
 log = logging.getLogger("harness.tools.calendar")
 
@@ -24,11 +23,18 @@ API = "https://www.googleapis.com/calendar/v3"
 
 
 class Calendar:
-    def __init__(self, auth: GoogleAuth, default_calendar: str, timezone: str):
+    def __init__(
+        self,
+        auth: GoogleAuth,
+        default_calendar: str,
+        timezone: str,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ):
         self._auth = auth
         self._default = default_calendar or "primary"
         self._tz = timezone
-        self._client = httpx.AsyncClient(timeout=25.0)
+        self._client = httpx.AsyncClient(timeout=25.0, transport=transport)
 
     @property
     def configured(self) -> bool:
@@ -192,76 +198,3 @@ class Calendar:
 
     async def aclose(self) -> None:
         await self._client.aclose()
-
-
-def register(registry: ToolRegistry, cal: Calendar) -> None:
-    registry.add(
-        "calendar_list_events",
-        "List events from Google Calendar. Use this to answer anything about "
-        "what is scheduled, when someone is free, or what is coming up.",
-        obj(
-            {
-                "days_ahead": integer("How many days forward to look. Default 7."),
-                "time_min": string("ISO 8601 start of the window. Overrides days_ahead."),
-                "time_max": string("ISO 8601 end of the window. Overrides days_ahead."),
-                "query": string("Free-text search over event titles and descriptions."),
-                "calendar_id": string("Calendar id. Defaults to the primary calendar."),
-                "max_results": integer("Maximum events to return, 1-100. Default 25."),
-            }
-        ),
-        cal.list_events,
-    )
-    registry.add(
-        "calendar_create_event",
-        "Create a new event on Google Calendar. Resolve relative dates like "
-        "'tomorrow at 6' into a full ISO 8601 datetime before calling.",
-        obj(
-            {
-                "summary": string("Event title."),
-                "start": string("ISO 8601 start, e.g. '2026-09-02T18:00:00'."),
-                "end": string("ISO 8601 end. Defaults to one hour after start."),
-                "description": string("Longer notes for the event."),
-                "location": string("Where the event happens."),
-                "all_day": string("'true' for an all-day event; start/end are dates."),
-                "calendar_id": string("Calendar id. Defaults to the primary calendar."),
-            },
-            ["summary", "start"],
-        ),
-        cal.create_event,
-    )
-    registry.add(
-        "calendar_update_event",
-        "Change an existing calendar event. Only the fields you pass are "
-        "modified. Get the event_id from calendar_list_events first.",
-        obj(
-            {
-                "event_id": string("Id of the event to change."),
-                "summary": string("New title."),
-                "start": string("New ISO 8601 start."),
-                "end": string("New ISO 8601 end."),
-                "description": string("New description."),
-                "location": string("New location."),
-                "calendar_id": string("Calendar id. Defaults to the primary calendar."),
-            },
-            ["event_id"],
-        ),
-        cal.update_event,
-    )
-    registry.add(
-        "calendar_delete_event",
-        "Delete a calendar event. Confirm with the user before calling this.",
-        obj(
-            {
-                "event_id": string("Id of the event to delete."),
-                "calendar_id": string("Calendar id. Defaults to the primary calendar."),
-            },
-            ["event_id"],
-        ),
-        cal.delete_event,
-    )
-    registry.add(
-        "calendar_list_calendars",
-        "List all calendars this account can see, with their ids.",
-        obj({}),
-        cal.list_calendars,
-    )

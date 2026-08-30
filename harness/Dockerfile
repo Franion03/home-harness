@@ -11,10 +11,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/ /app/
 
-# Session database lives on a PVC mounted here.
-RUN mkdir -p /data && \
-    useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin harness && \
-    chown -R harness:harness /app /data
+# The harness is stateless: no volume, nothing writable at runtime.
+RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin harness && \
+    chown -R harness:harness /app
 USER 10001
 
 EXPOSE 8080

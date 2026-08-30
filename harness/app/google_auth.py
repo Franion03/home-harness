@@ -20,13 +20,20 @@ EXPIRY_SKEW_SECONDS = 60
 
 
 class GoogleAuth:
-    def __init__(self, client_id: str, client_secret: str, refresh_token: str):
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: str,
+        refresh_token: str,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ):
         self._client_id = client_id
         self._client_secret = client_secret
         self._refresh_token = refresh_token
         self._access_token = ""
         self._expires_at = 0.0
-        self._client = httpx.AsyncClient(timeout=20.0)
+        self._client = httpx.AsyncClient(timeout=20.0, transport=transport)
 
     @property
     def configured(self) -> bool:

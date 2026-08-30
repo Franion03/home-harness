@@ -1,75 +1,62 @@
 # home-harness — notes for Claude
 
-LLM-agnostic agent harness. Voice + Home Assistant + Google Calendar.
+An OpenAPI tool server: Home Assistant + Google Calendar, for an LLM to call.
 
-**This repo builds the harness; it does not deploy it.** Kubernetes manifests,
-ingress, storage, secrets and the live `models.yaml` live in
-`Franion03/arr-stack` under `apps/harness/`, synced by the `arr-stack-root`
-ArgoCD Application. Do not add deployment YAML here — that split is deliberate.
-CI publishes `ghcr.io/franion03/home-harness:latest` on every push to `master`.
+**Open WebUI is the assistant.** It owns the UI, sessions, auth, voice and
+model routing. This repo owns the house. Deployment for both lives in
+`Franion03/arr-stack` under `apps/assistant/`.
 
 ## The invariant that matters
 
-**No vendor or model name may appear outside `harness/app/provider_*.py`,
-`llm.py`'s `build_registry()`, and `models.yaml`.**
+**No model vendor, model id, API key or agent loop belongs in this repo.**
 
-If a change would put `claude`, `gpt`, `gemini`, an `anthropic.` import or a
-vendor URL into `agent.py`, `main.py`, `tool_*.py` or `speech.py`, it is the
-wrong change. Add or extend an adapter instead. The canonical vocabulary is in
-`provider_base.py`; everything above it is vendor-blind by construction.
+There is no provider abstraction here any more and there should not be one —
+Open WebUI does that job. If a change wants to call an LLM, add a tool
+instead and let the model decide when to use it. Earlier revisions of this
+repo contained a full provider/router/agent-loop stack; it was removed
+deliberately once Open WebUI took that role.
 
-## Architecture in one pass
+## The OpenAPI spec is the prompt
 
-- `provider_base.py` — `Message`, `Text`, `ToolUse`, `ToolResult`, `ToolSpec`,
-  `Completion`, `ProviderError(retryable=...)`. The `Provider` protocol is a
-  single `complete()` method.
-- `gateway.py` — all HTTP egress. Builds Cloudflare AI Gateway URLs
-  (`/v1/{account}/{gateway}/{provider}/{path}`) or, with
-  `AI_GATEWAY_MODE=direct`, each vendor's own base URL. Classifies 4xx as
-  non-retryable so the router does not waste a fallback on a bad request.
-- `llm.py` — `split_ref()` splits `provider/model` on the **first** slash only
-  (OpenRouter and Workers AI model ids contain their own). `Router.complete()`
-  walks `[primary, fallback]`.
-- `agent.py` — the loop. Tool results for one assistant turn go back in a
-  **single** user message; splitting them teaches models to stop batching.
-- `memory.py` — SQLite on the PVC. `_repair()` trims a window that starts with
-  an orphan `tool_result` or ends with an unanswered `tool_use`; every provider
-  rejects those.
+Open WebUI reads `/openapi.json` and turns every operation into a tool. So
+`summary`, `description` and every `Field(description=...)` in `main.py` are
+**model-facing prompt text**, not documentation. Write them as instructions:
+when to call this, what to do first, what to confirm before acting.
 
-## Provider gotchas that are already handled — do not "fix" them
+`test_harness.py::TestOpenAPIContract` enforces this — an operation with no
+`operationId`, no summary, a description under 40 characters, or an
+undescribed parameter fails CI. Do not weaken those tests to make a change
+pass; write the description.
 
-- **Anthropic**: Opus 5 / Sonnet 5 / Fable 5 / Opus 4.6-4.8 reject
-  `temperature` with a 400. `NO_SAMPLING_PREFIXES` in `provider_anthropic.py`
-  drops it. They also reject `thinking.budget_tokens`; use
-  `thinking: adaptive` and `output_config.effort`.
-- **Google**: the assistant role is `model`, not `assistant`. Function calls
-  carry no id, so ids are synthesised as `name:index` and decoded back in
-  `_encode_message`. `_clean_schema()` strips `additionalProperties`, `$schema`
-  and `default`, which Gemini 400s on.
-- **OpenAI**: one canonical `Message` holding tool results expands into several
-  `role: "tool"` messages. Tool arguments arrive as a **JSON string** and can be
-  malformed — always `json.loads` in a try block.
+Set `operation_id=` explicitly on every route. FastAPI's generated ids are
+unreadable, and the id becomes the tool name the model sees.
 
-## Conventions
+## Things already handled — do not "fix" them
 
-- Flat module layout in `harness/app/` on purpose: it keeps every module one
-  hop from `main.py` and lets the whole app be mounted from a ConfigMap if a
-  registry is ever unavailable. Imports are bare (`from config import ...`),
-  so a nested package would break every one of them.
-- Dependencies stay at fastapi + uvicorn + httpx + pydantic + PyYAML +
-  python-multipart. Google Calendar is raw REST specifically to avoid
-  `google-api-python-client`.
-- Tests are standard-library `unittest`, no network, no keys:
-  `python harness/tests/test_harness.py`.
-- `harness/models.example.yaml` documents the routing format. The copy that
-  actually runs is `apps/harness/models.yaml` in arr-stack; keep them in step
-  when the format changes.
+- **`list_entities` summarises and caps at 200.** A full `/api/states` dump is
+  tens of thousands of tokens. Single-entity reads strip `icon`,
+  `supported_features` and the `*_modes` lists for the same reason.
+- **`INTERESTING_DOMAINS` filters the default listing**, but an explicit
+  `domain=` still reaches past it — so nothing is truly hidden.
+- **Exception handlers in `main.py` convert upstream failures into legible
+  messages** (503 unreachable, 502 with "the request was not applied"). The
+  model reads these and recovers; a bare traceback teaches it nothing.
+- **Calendar ids are percent-encoded** — they are usually email addresses and
+  land in a path segment.
+- **`/openapi.json` is reachable without the API key.** Open WebUI fetches the
+  spec before it has anywhere to put a key. `/health` is `include_in_schema=False`
+  so it never becomes a tool.
+- **`call_service` accepts `data` as a dict or a JSON string.** FastAPI gives a
+  dict; a hand-written call may give a string.
 
-## Where it runs (for context — none of this is configured here)
+## Tests
 
-- Server `192.168.1.114`, k3d cluster `arr-cluster`, context `k3d-arr-cluster`.
-- Namespace `assistant`. Ingress `assistant.192.168.1.114.nip.io`, class nginx.
-- Home Assistant is a **separate box at `192.168.1.117:8123`**, not in the
-  cluster.
-- The PVC is `local-path` RWO, so the Deployment strategy must stay `Recreate`.
-- All of the above is defined in arr-stack `apps/harness/`, not here.
+`python harness/tests/test_harness.py` — 33 tests, upstreams stubbed with
+`httpx.MockTransport`. No network, no credentials. Do not add real API keys to
+CI; nothing there needs them.
+
+## Cluster facts (defined in arr-stack, not here)
+
+- Namespace `assistant`. This service is ClusterIP-only with a NetworkPolicy
+  admitting only Open WebUI — it can unlock doors and delete calendar events.
+- Home Assistant is a separate box at `192.168.1.117:8123`, not in the cluster.

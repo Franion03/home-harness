@@ -1,45 +1,35 @@
-"""home-harness -- an LLM-agnostic assistant for the house.
+"""home-harness — an OpenAPI tool server for the house.
 
-FastAPI surface:
-    GET  /                      the voice PWA
-    GET  /health                liveness plus the active configuration
-    POST /v1/chat               text in, text out
-    POST /v1/voice              audio in, transcript + spoken answer out
-    POST /v1/transcribe         audio in, text out
-    POST /v1/speak              text in, audio out
-    GET  /v1/sessions           recent sessions
-    DEL  /v1/sessions/{id}      forget a conversation
-    POST /v1/admin/reload       re-read models.yaml without a restart
+Open WebUI owns the chat UI, sessions, voice and model routing. This service
+owns the two things it cannot: control of Home Assistant and management of a
+Google Calendar. Open WebUI reads the OpenAPI spec this app publishes and
+turns every operation below into a tool the model can call.
+
+That is why the summaries and field descriptions here are unusually
+deliberate: they are not documentation for a human reader, they are the
+prompt the model sees when deciding whether and how to call a tool.
+
+    Open WebUI → Settings → Tools → add  http://harness.assistant.svc.cluster.local
 """
 
 from __future__ import annotations
 
-import base64
 import logging
 import os
 import sys
-import uuid
 from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+import httpx
+from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from agent import Agent
-from config import Settings
-from gateway import Gateway
-from google_auth import GoogleAuth
-from llm import Router, build_registry
-from memory import Memory
-from provider_base import ProviderError
-from speech import Speech
-from tool_registry import ToolRegistry, obj, string
 import tool_calendar
 import tool_homeassistant
+from config import Settings
+from google_auth import GoogleAuth
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -48,74 +38,39 @@ logging.basicConfig(
 )
 log = logging.getLogger("harness")
 
-STATIC_DIR = Path(__file__).parent / "static"
-
 
 class Services:
-    """Everything built once at startup and shared by the request handlers."""
-
     def __init__(self) -> None:
         self.settings = Settings()
-        self.gateway = Gateway(
-            account_id=self.settings.cf_account_id,
-            gateway_name=self.settings.cf_gateway,
-            mode=self.settings.gateway_mode,
-            gateway_token=self.settings.cf_gateway_token,
-            cache_ttl=self.settings.cache_ttl,
-        )
-        self.router = Router(self.settings, build_registry(self.settings, self.gateway))
-        self.memory = Memory(self.settings.db_path)
-        self.speech = Speech(self.settings, self.gateway)
-        self.registry = ToolRegistry()
         self.ha: tool_homeassistant.HomeAssistant | None = None
         self.calendar: tool_calendar.Calendar | None = None
         self.google_auth: GoogleAuth | None = None
-        self._wire_tools()
-        self.agent = Agent(
-            settings=self.settings,
-            router=self.router,
-            registry=self.registry,
-            memory=self.memory,
-        )
 
-    def _wire_tools(self) -> None:
-        s = self.settings
-        if s.ha_url and s.ha_token:
-            self.ha = tool_homeassistant.HomeAssistant(s.ha_url, s.ha_token)
-            tool_homeassistant.register(self.registry, self.ha)
-            log.info("Home Assistant tools enabled (%s)", s.ha_url)
+        if self.settings.ha_enabled:
+            self.ha = tool_homeassistant.HomeAssistant(
+                self.settings.ha_url, self.settings.ha_token
+            )
+            log.info("Home Assistant tools enabled (%s)", self.settings.ha_url)
         else:
-            log.warning("Home Assistant tools disabled -- HA_URL/HA_TOKEN not set")
+            log.warning("Home Assistant tools disabled — HA_URL/HA_TOKEN not set")
 
         self.google_auth = GoogleAuth(
-            s.google_client_id, s.google_client_secret, s.google_refresh_token
+            self.settings.google_client_id,
+            self.settings.google_client_secret,
+            self.settings.google_refresh_token,
         )
-        if self.google_auth.configured:
+        if self.settings.calendar_enabled:
             self.calendar = tool_calendar.Calendar(
-                self.google_auth, s.calendar_id, s.timezone
+                self.google_auth, self.settings.calendar_id, self.settings.timezone
             )
-            tool_calendar.register(self.registry, self.calendar)
-            log.info("Google Calendar tools enabled (calendar=%s)", s.calendar_id)
+            log.info("Google Calendar tools enabled (%s)", self.settings.calendar_id)
         else:
             log.warning(
-                "Google Calendar tools disabled -- run scripts/google_oauth.py to "
-                "get a refresh token"
+                "Google Calendar tools disabled — run scripts/google_oauth.py "
+                "for a refresh token"
             )
 
-        self.registry.add(
-            "remember_nothing",
-            "Discard the current conversation history and start fresh. Use only "
-            "when the user explicitly asks to forget or start over.",
-            obj({"session_id": string("Session to clear.")}, ["session_id"]),
-            self._forget,
-        )
-
-    async def _forget(self, session_id: str) -> str:
-        removed = await self.memory.clear(session_id)
-        return f"Cleared {removed} stored messages."
-
     async def aclose(self) -> None:
-        await self.gateway.aclose()
         if self.ha:
             await self.ha.aclose()
         if self.calendar:
@@ -131,11 +86,11 @@ services: Services | None = None
 async def lifespan(app: FastAPI):
     global services
     services = Services()
-    log.info("harness ready: %s", services.settings.describe())
+    log.info("tool server ready: %s", services.settings.describe())
     if not services.settings.api_key:
         log.warning(
-            "HARNESS_API_KEY is unset -- the API is unauthenticated. Only safe "
-            "behind Cloudflare Access or on a trusted LAN."
+            "TOOLS_API_KEY is unset — this server is unauthenticated. It can "
+            "unlock doors and delete calendar events; keep it inside the cluster."
         )
     try:
         yield
@@ -143,13 +98,63 @@ async def lifespan(app: FastAPI):
         await services.aclose()
 
 
-app = FastAPI(title="home-harness", version="1.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="Home Tools",
+    version="3.0.0",
+    summary="Control Home Assistant and manage Google Calendar.",
+    description=(
+        "Tools for a household assistant. Use the Home Assistant operations to "
+        "read and change the state of the house, and the calendar operations to "
+        "read and manage the user's schedule."
+    ),
+    lifespan=lifespan,
+)
+
+# Open WebUI calls this server from the browser when a user registers it as a
+# personal tool server, so the spec and the operations must be reachable
+# cross-origin.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ── error handling ───────────────────────────────────────────────────────
+#
+# A tool call that fails must come back as a legible message, because the
+# model is the one that reads it and decides what to do next. An unhandled
+# exception would surface to Open WebUI as a bare 500 with a traceback, which
+# tells the model nothing and tells the user less.
+
+
+@app.exception_handler(httpx.HTTPStatusError)
+async def upstream_status_error(request: Request, exc: httpx.HTTPStatusError):
+    upstream = "Home Assistant" if "/ha/" in request.url.path else "Google Calendar"
+    log.warning("%s returned %s for %s", upstream, exc.response.status_code, request.url.path)
+    return JSONResponse(
+        status_code=502,
+        content={"detail": f"{upstream} returned {exc.response.status_code}. "
+                           f"The request was not applied."},
+    )
+
+
+@app.exception_handler(httpx.HTTPError)
+async def upstream_transport_error(request: Request, exc: httpx.HTTPError):
+    upstream = "Home Assistant" if "/ha/" in request.url.path else "Google Calendar"
+    log.warning("%s unreachable: %s", upstream, exc)
+    return JSONResponse(
+        status_code=503,
+        content={"detail": f"{upstream} is unreachable right now."},
+    )
+
+
+@app.exception_handler(RuntimeError)
+async def runtime_error(request: Request, exc: RuntimeError):
+    # Raised by GoogleAuth when a refresh fails, among others.
+    log.warning("tool failed: %s", exc)
+    return JSONResponse(status_code=502, content={"detail": str(exc)})
 
 
 def svc() -> Services:
@@ -159,7 +164,6 @@ def svc() -> Services:
 
 
 async def require_key(request: Request) -> None:
-    """Shared-secret check. A no-op when HARNESS_API_KEY is unset."""
     expected = svc().settings.api_key
     if not expected:
         return
@@ -174,141 +178,307 @@ async def require_key(request: Request) -> None:
 Guarded = Depends(require_key)
 
 
-# ---- models ------------------------------------------------------------
+def ha() -> tool_homeassistant.HomeAssistant:
+    h = svc().ha
+    if h is None:
+        raise HTTPException(
+            503, "Home Assistant is not configured on this server (HA_URL/HA_TOKEN)"
+        )
+    return h
 
 
-class ChatRequest(BaseModel):
-    message: str = Field(min_length=1)
-    session_id: str = ""
-    route: str = "chat"
-    speak: bool = False
+def cal() -> tool_calendar.Calendar:
+    c = svc().calendar
+    if c is None:
+        raise HTTPException(
+            503, "Google Calendar is not configured on this server (no refresh token)"
+        )
+    return c
 
 
-class SpeakRequest(BaseModel):
-    text: str = Field(min_length=1)
+# ── health ───────────────────────────────────────────────────────────────
 
 
-# ---- routes ------------------------------------------------------------
-
-
-@app.get("/health")
+@app.get("/health", include_in_schema=False)
 async def health() -> dict[str, Any]:
-    s = svc()
+    return {"status": "ok", "service": "home-harness", "version": app.version,
+            **svc().settings.describe()}
+
+
+# ── Home Assistant ───────────────────────────────────────────────────────
+
+
+class ServiceCall(BaseModel):
+    domain: str = Field(
+        description="Service domain, for example 'light', 'switch', 'climate', "
+                    "'cover', 'lock', 'media_player', 'scene' or 'script'.",
+        examples=["light"],
+    )
+    service: str = Field(
+        description="Service name within the domain, for example 'turn_on', "
+                    "'turn_off', 'toggle', 'set_temperature' or 'open_cover'.",
+        examples=["turn_off"],
+    )
+    entity_id: str = Field(
+        default="",
+        description="The entity to act on, for example 'light.kitchen'. Leave "
+                    "empty only for services that need no target.",
+        examples=["light.kitchen"],
+    )
+    data: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Extra parameters for the service, for example "
+                    '{"brightness_pct": 40} or {"temperature": 21}.',
+        examples=[{"brightness_pct": 40}],
+    )
+
+
+class Phrase(BaseModel):
+    text: str = Field(
+        description="A natural-language command to hand to Home Assistant's own "
+                    "intent engine.",
+        examples=["turn off everything downstairs"],
+    )
+
+
+@app.get(
+    "/ha/entities",
+    operation_id="list_home_entities",
+    summary="List devices and sensors in the house with their current state",
+    description=(
+        "Search the house for devices, lights, switches, sensors, covers, locks "
+        "and media players. Call this first whenever you do not already know an "
+        "entity's exact id. Filter by domain, by a search word matching the "
+        "name, or both."
+    ),
+    dependencies=[Guarded],
+    tags=["Home Assistant"],
+)
+async def list_home_entities(
+    domain: Annotated[str, Query(
+        description="Restrict to one domain, e.g. 'light', 'sensor', 'climate'.",
+    )] = "",
+    search: Annotated[str, Query(
+        description="Case-insensitive substring of the friendly name or entity id.",
+    )] = "",
+) -> dict[str, Any]:
+    return {"result": await ha().list_entities(domain=domain, search=search)}
+
+
+@app.get(
+    "/ha/entities/{entity_id}",
+    operation_id="get_home_entity_state",
+    summary="Get the current state and attributes of one device or sensor",
+    description=(
+        "Read one entity in full: its state and its attributes, such as "
+        "brightness, temperature or battery level."
+    ),
+    dependencies=[Guarded],
+    tags=["Home Assistant"],
+)
+async def get_home_entity_state(
+    entity_id: Annotated[str, Path(
+        description="Exact entity id, for example 'light.kitchen' or "
+                    "'sensor.living_room_temperature'.",
+    )],
+) -> dict[str, Any]:
+    return {"result": await ha().get_state(entity_id)}
+
+
+@app.post(
+    "/ha/service",
+    operation_id="control_home_device",
+    summary="Turn a device on or off, or change a setting in the house",
+    description=(
+        "Change something in the house: switch lights or plugs on and off, set "
+        "brightness or a thermostat, open or close covers, lock or unlock, or "
+        "run a scene or script. Confirm with the user first before switching "
+        "off something someone may be using, or unlocking anything."
+    ),
+    dependencies=[Guarded],
+    tags=["Home Assistant"],
+)
+async def control_home_device(call: ServiceCall) -> dict[str, Any]:
     return {
-        "status": "ok",
-        "service": "home-harness",
-        "tools": s.registry.names(),
-        **s.settings.describe(),
+        "result": await ha().call_service(
+            domain=call.domain,
+            service=call.service,
+            entity_id=call.entity_id,
+            data=call.data,
+        )
     }
 
 
-@app.post("/v1/chat", dependencies=[Guarded])
-async def chat(req: ChatRequest) -> JSONResponse:
-    s = svc()
-    session_id = req.session_id or uuid.uuid4().hex[:12]
-    try:
-        result = await s.agent.run(req.message, session_id=session_id, route_name=req.route)
-    except ProviderError as exc:
-        raise HTTPException(502, f"model call failed: {exc}") from exc
+@app.post(
+    "/ha/conversation",
+    operation_id="ask_home_assistant",
+    summary="Send a phrase to Home Assistant's own built-in intent engine",
+    description=(
+        "Hand a natural-language command straight to Home Assistant. Useful for "
+        "area-wide commands like 'turn off everything downstairs', and for "
+        "custom sentences the user has configured in Home Assistant, which this "
+        "server knows nothing about."
+    ),
+    dependencies=[Guarded],
+    tags=["Home Assistant"],
+)
+async def ask_home_assistant(phrase: Phrase) -> dict[str, Any]:
+    return {"result": await ha().conversation(phrase.text)}
 
-    payload: dict[str, Any] = {
-        "text": result.text,
-        "session_id": result.session_id,
-        "model": result.model,
-        "tool_calls": result.tool_calls,
-        "usage": {
-            "input_tokens": result.usage.input_tokens,
-            "output_tokens": result.usage.output_tokens,
-        },
-        "elapsed_ms": result.elapsed_ms,
+
+# ── Google Calendar ──────────────────────────────────────────────────────
+
+
+class NewEvent(BaseModel):
+    summary: str = Field(
+        description="The event title.", examples=["Dentist"]
+    )
+    start: str = Field(
+        description="ISO 8601 start time, for example '2026-09-02T18:00:00'. "
+                    "Resolve relative dates like 'tomorrow at 6' yourself before "
+                    "calling.",
+        examples=["2026-09-02T18:00:00"],
+    )
+    end: str = Field(
+        default="",
+        description="ISO 8601 end time. Defaults to one hour after the start.",
+    )
+    description: str = Field(default="", description="Longer notes for the event.")
+    location: str = Field(default="", description="Where the event takes place.")
+    all_day: bool = Field(
+        default=False,
+        description="True for an all-day event; start and end are then dates.",
+    )
+    calendar_id: str = Field(
+        default="", description="Calendar id. Defaults to the primary calendar."
+    )
+
+
+class EventPatch(BaseModel):
+    summary: str = Field(default="", description="New title, if changing it.")
+    start: str = Field(default="", description="New ISO 8601 start, if moving it.")
+    end: str = Field(default="", description="New ISO 8601 end, if moving it.")
+    description: str = Field(default="", description="New description.")
+    location: str = Field(default="", description="New location.")
+    calendar_id: str = Field(
+        default="", description="Calendar id. Defaults to the primary calendar."
+    )
+
+
+@app.get(
+    "/calendar/events",
+    operation_id="list_calendar_events",
+    summary="Look up what is scheduled on the user's calendar",
+    description=(
+        "Read upcoming events. Use this for anything about what is scheduled, "
+        "when the user is free or busy, or what is coming up. Returns each "
+        "event's id, title, start, end and location."
+    ),
+    dependencies=[Guarded],
+    tags=["Calendar"],
+)
+async def list_calendar_events(
+    days_ahead: Annotated[int, Query(
+        ge=1, le=365,
+        description="How many days forward to look from now. Ignored if "
+                    "time_min and time_max are given.",
+    )] = 7,
+    time_min: Annotated[str, Query(
+        description="ISO 8601 start of the window. Overrides days_ahead.",
+    )] = "",
+    time_max: Annotated[str, Query(
+        description="ISO 8601 end of the window. Overrides days_ahead.",
+    )] = "",
+    query: Annotated[str, Query(
+        description="Free-text search over event titles and descriptions.",
+    )] = "",
+    calendar_id: Annotated[str, Query(
+        description="Calendar id. Defaults to the primary calendar.",
+    )] = "",
+    max_results: Annotated[int, Query(
+        ge=1, le=100, description="Maximum events to return.",
+    )] = 25,
+) -> dict[str, Any]:
+    return {
+        "result": await cal().list_events(
+            days_ahead=days_ahead, time_min=time_min, time_max=time_max,
+            query=query, calendar_id=calendar_id, max_results=max_results,
+        )
     }
-    if req.speak and result.text:
-        audio, mime = await s.speech.synthesize(result.text)
-        payload["audio"] = base64.b64encode(audio).decode()
-        payload["audio_mime"] = mime
-    return JSONResponse(payload)
 
 
-@app.post("/v1/voice", dependencies=[Guarded])
-async def voice(
-    audio: UploadFile = File(...),
-    session_id: str = Form(""),
-    route: str = Form("voice"),
-    speak: str = Form("true"),
-) -> JSONResponse:
-    """The phone/laptop path: record, upload, get a spoken answer back."""
-    s = svc()
-    raw = await audio.read()
-    if not raw:
-        raise HTTPException(400, "empty audio upload")
-
-    try:
-        transcript = await s.speech.transcribe(raw, filename=audio.filename or "audio.webm")
-    except ProviderError as exc:
-        raise HTTPException(502, f"transcription failed: {exc}") from exc
-
-    sid = session_id or uuid.uuid4().hex[:12]
-    try:
-        result = await s.agent.run(transcript, session_id=sid, route_name=route)
-    except ProviderError as exc:
-        raise HTTPException(502, f"model call failed: {exc}") from exc
-
-    payload: dict[str, Any] = {
-        "transcript": transcript,
-        "text": result.text,
-        "session_id": result.session_id,
-        "model": result.model,
-        "tool_calls": result.tool_calls,
-        "elapsed_ms": result.elapsed_ms,
+@app.post(
+    "/calendar/events",
+    operation_id="create_calendar_event",
+    summary="Add a new event to the user's calendar",
+    description=(
+        "Create an event. Work out the absolute date and time before calling — "
+        "the server does not interpret phrases like 'next Tuesday'."
+    ),
+    dependencies=[Guarded],
+    tags=["Calendar"],
+)
+async def create_calendar_event(event: NewEvent) -> dict[str, Any]:
+    return {
+        "result": await cal().create_event(
+            summary=event.summary, start=event.start, end=event.end,
+            description=event.description, location=event.location,
+            all_day="true" if event.all_day else "", calendar_id=event.calendar_id,
+        )
     }
-    if speak.lower() in ("true", "1", "yes") and result.text:
-        try:
-            data, mime = await s.speech.synthesize(result.text)
-            payload["audio"] = base64.b64encode(data).decode()
-            payload["audio_mime"] = mime
-        except ProviderError as exc:
-            # A missing voice should not cost you the answer.
-            log.warning("TTS failed, returning text only: %s", exc)
-            payload["tts_error"] = str(exc)
-    return JSONResponse(payload)
 
 
-@app.post("/v1/transcribe", dependencies=[Guarded])
-async def transcribe(audio: UploadFile = File(...)) -> dict[str, str]:
-    raw = await audio.read()
-    if not raw:
-        raise HTTPException(400, "empty audio upload")
-    text = await svc().speech.transcribe(raw, filename=audio.filename or "audio.webm")
-    return {"text": text}
+@app.patch(
+    "/calendar/events/{event_id}",
+    operation_id="update_calendar_event",
+    summary="Change an existing calendar event",
+    description=(
+        "Modify an event. Only the fields you provide are changed. Get the "
+        "event_id from list_calendar_events first."
+    ),
+    dependencies=[Guarded],
+    tags=["Calendar"],
+)
+async def update_calendar_event(
+    event_id: Annotated[str, Path(description="Id of the event to change.")],
+    patch: EventPatch,
+) -> dict[str, Any]:
+    return {
+        "result": await cal().update_event(
+            event_id=event_id, summary=patch.summary, start=patch.start,
+            end=patch.end, description=patch.description, location=patch.location,
+            calendar_id=patch.calendar_id,
+        )
+    }
 
 
-@app.post("/v1/speak", dependencies=[Guarded])
-async def speak(req: SpeakRequest) -> Response:
-    data, mime = await svc().speech.synthesize(req.text)
-    return Response(content=data, media_type=mime)
+@app.delete(
+    "/calendar/events/{event_id}",
+    operation_id="delete_calendar_event",
+    summary="Delete an event from the user's calendar",
+    description=(
+        "Permanently remove an event. Always confirm with the user before "
+        "calling this."
+    ),
+    dependencies=[Guarded],
+    tags=["Calendar"],
+)
+async def delete_calendar_event(
+    event_id: Annotated[str, Path(description="Id of the event to delete.")],
+    calendar_id: Annotated[str, Query(
+        description="Calendar id. Defaults to the primary calendar.",
+    )] = "",
+) -> dict[str, Any]:
+    return {"result": await cal().delete_event(event_id=event_id, calendar_id=calendar_id)}
 
 
-@app.get("/v1/sessions", dependencies=[Guarded])
-async def sessions() -> list[dict[str, Any]]:
-    return await svc().memory.sessions()
-
-
-@app.delete("/v1/sessions/{session_id}", dependencies=[Guarded])
-async def forget(session_id: str) -> dict[str, Any]:
-    removed = await svc().memory.clear(session_id)
-    return {"session_id": session_id, "removed": removed}
-
-
-@app.post("/v1/admin/reload", dependencies=[Guarded])
-async def reload_config() -> dict[str, Any]:
-    """Pick up a models.yaml edit without restarting the pod."""
-    s = svc()
-    s.settings.reload_routes()
-    log.info("reloaded routes: %s", s.settings.describe())
-    return {"reloaded": True, **s.settings.describe()}
-
-
-if STATIC_DIR.is_dir():
-    app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
-else:  # pragma: no cover
-    log.warning("static directory %s missing -- PWA not served", STATIC_DIR)
+@app.get(
+    "/calendar/calendars",
+    operation_id="list_calendars",
+    summary="List the calendars this account can see",
+    description="Return every calendar available, with its id and access level.",
+    dependencies=[Guarded],
+    tags=["Calendar"],
+)
+async def list_calendars() -> dict[str, Any]:
+    return {"result": await cal().list_calendars()}

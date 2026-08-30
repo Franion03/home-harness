@@ -1,138 +1,110 @@
 # home-harness
 
-An agent harness that does not depend on which LLM you plug into it. Talk to it
-by voice from a phone or a laptop; it controls Home Assistant and manages
-Google Calendar.
+An **OpenAPI tool server** that lets an LLM control Home Assistant and manage
+a Google Calendar.
 
-**This repo builds the harness. It does not deploy it.** Deployment lives in
-[arr-stack/apps/harness](https://github.com/Franion03/arr-stack/tree/master/apps/harness),
-which ArgoCD syncs onto the home cluster.
-
-| Concern | Where |
-|---|---|
-| Python source, Dockerfile, tests, CI image build | here |
-| Manifests, ingress, storage, secrets, live `models.yaml` | `Franion03/arr-stack` → `apps/harness/` |
-
-CI publishes `ghcr.io/franion03/home-harness:latest` on every push to `master`.
+It is deliberately small. [Open WebUI](https://docs.openwebui.com) provides the
+chat interface, conversation storage, authentication, voice in and out, and
+model routing — all of it better than a hand-rolled version would. This server
+provides the one thing it cannot: the house.
 
 ```
-  phone / laptop (PWA)
-          │  HTTPS — hold to talk
-          ▼
-  ┌───────────────────────────────────────────┐
-  │  harness                                  │
-  │                                           │
-  │   FastAPI  ─ /v1/chat  /v1/voice          │
-  │      │                                    │
-  │   agent loop ── tools ──┬── Home Assistant│──▶ HA REST API
-  │      │                  └── Google Calendar│──▶ Calendar API v3
-  │      │                                    │
-  │   router ── route → primary, fallback     │
-  │      │      (from models.yaml)            │
-  │      ▼                                    │
-  │   adapters: anthropic │ openai │ google   │
-  └──────────┬────────────────────────────────┘
-             ▼
-   Cloudflare AI Gateway  ── caching, cost analytics, rate limits
-             ▼
-   Anthropic · OpenAI · Gemini · OpenRouter · Groq · Workers AI
+  Open WebUI
+    │  UI · sessions · auth · voice · model routing
+    │
+    ├─ models ──▶ Cloudflare AI Gateway ──▶ Anthropic · OpenAI · Gemini · …
+    │
+    └─ tools  ──▶ home-harness  (this repo)
+                    ├─ Home Assistant   read state, call services, intents
+                    └─ Google Calendar  read, create, update, delete
 ```
 
-## Why it is LLM-agnostic
+Open WebUI reads the OpenAPI spec this app publishes and turns **every
+operation into a tool**. No plugin API, no SDK, no lock-in: any client that
+speaks OpenAPI can use it.
 
-No file in `harness/app/` outside `provider_*.py` names a vendor or a model.
-The agent loop, the tools and the API all speak one canonical vocabulary —
-`Message`, `ToolSpec`, `ToolUse`, `ToolResult`, `Completion` — defined in
-`provider_base.py`. Each adapter's only job is translating that to and from one
-vendor's wire format.
+CI publishes `ghcr.io/franion03/home-harness:latest`. Deployment lives in
+[arr-stack](https://github.com/Franion03/arr-stack) under `apps/assistant/`.
 
-Which model answers lives in **`models.yaml`** (see `harness/models.example.yaml`;
-the live copy is in arr-stack), mounted as a ConfigMap:
+## Registering it
 
-```yaml
-routes:
-  chat:
-    primary: anthropic/claude-opus-5     # ← change this line
-    fallback: openai/gpt-4o
-```
-
-No code change, no rebuild, no new image. The same applies to speech: `stt:`
-and `tts:` are model references with fallbacks, exactly like the chat routes.
-
-Adding a vendor nobody has written an adapter for is one file plus one line in
-`build_registry()`. If it speaks `/v1/chat/completions`, it is just the line —
-`provider_openai.py` already covers OpenAI, OpenRouter, Groq, Mistral, DeepSeek
-and Cloudflare Workers AI.
-
-**Fallbacks are for availability, not cost.** When the primary rate-limits or
-5xxs, the route's fallback answers, so the house keeps working through a vendor
-outage. Point it at a *different vendor* than the primary. A 4xx is treated as
-non-retryable — a malformed request would fail identically on the fallback.
-
-## Layout
+Open WebUI → **Settings → Tools → +** and add the server URL:
 
 ```
-harness/app/               flat modules — deliberately not a nested package
-  provider_base.py         canonical types every layer above speaks
-  provider_anthropic.py    native Messages API (tool use, thinking, effort)
-  provider_openai.py       /v1/chat/completions — 6 vendors, one adapter
-  provider_google.py       Gemini generateContent
-  gateway.py               Cloudflare AI Gateway transport
-  llm.py                   registry + fallback router
-  agent.py                 the tool loop
-  tool_registry.py         JSON Schema tool descriptions + dispatch
-  tool_homeassistant.py    entities, states, services, HA's own intent engine
-  tool_calendar.py         Calendar API v3 over raw REST
-  google_auth.py           refresh token → access token
-  speech.py                STT and TTS, same route-and-fallback pattern
-  memory.py                per-session history in SQLite
-  main.py                  FastAPI surface
-  static/                  the voice PWA
-harness/tests/             28 tests, standard library only
-harness/models.example.yaml  routing config reference
-scripts/google_oauth.py    one-time Google consent → refresh token
+http://harness.assistant.svc.cluster.local
 ```
 
-## API
+with `TOOLS_API_KEY` as the Bearer token. Admins can add it under
+*Settings → Admin → Integrations* to share it with every user.
 
-| Method | Path | Purpose |
+## The tools
+
+| Operation | Method | What it does |
 |---|---|---|
-| `GET` | `/` | the voice PWA |
-| `GET` | `/health` | liveness + the active configuration (unauthenticated) |
-| `POST` | `/v1/chat` | `{message, session_id?, route?, speak?}` → text (+ audio) |
-| `POST` | `/v1/voice` | multipart audio → transcript, answer, spoken reply |
-| `POST` | `/v1/transcribe` | multipart audio → text |
-| `POST` | `/v1/speak` | `{text}` → audio bytes |
-| `GET` | `/v1/sessions` | recent conversations |
-| `DELETE` | `/v1/sessions/{id}` | forget a conversation |
-| `POST` | `/v1/admin/reload` | re-read `models.yaml` without restarting |
+| `list_home_entities` | `GET /ha/entities` | search devices and sensors, with state |
+| `get_home_entity_state` | `GET /ha/entities/{id}` | one entity in full |
+| `control_home_device` | `POST /ha/service` | turn things on/off, set values, run scenes |
+| `ask_home_assistant` | `POST /ha/conversation` | hand a phrase to HA's own intent engine |
+| `list_calendar_events` | `GET /calendar/events` | what is scheduled |
+| `create_calendar_event` | `POST /calendar/events` | add an event |
+| `update_calendar_event` | `PATCH /calendar/events/{id}` | change an event |
+| `delete_calendar_event` | `DELETE /calendar/events/{id}` | remove an event |
+| `list_calendars` | `GET /calendar/calendars` | available calendars |
 
-Everything except `/health` and the PWA requires `X-API-Key` (or
-`Authorization: Bearer`) matching `HARNESS_API_KEY`.
+`GET /health` reports which integrations came up. It is excluded from the
+spec, so it never appears as a tool.
 
-## Running it locally
+Everything else requires `Authorization: Bearer $TOOLS_API_KEY` (or
+`X-API-Key`). The spec itself is readable without one, because Open WebUI
+fetches it before it has anywhere to put a key.
 
-```bash
-cp .env.example .env          # fill in at least one vendor key
-set -a && . ./.env && set +a
-pip install -r harness/requirements.txt
-cd harness/app && uvicorn main:app --reload --port 8080
-```
+## The descriptions are the prompt
 
-Then open http://localhost:8080. `localhost` is a secure context, so the
-microphone works without HTTPS.
+Every `summary`, `description` and field description in `main.py` is written
+for the **model**, not for a human reader — they become the tool definitions
+the model uses to decide whether and how to call something. That is why they
+say things like *"Call this first whenever you do not already know an entity's
+exact id"* and *"Always confirm with the user before calling this."*
+
+The test suite enforces it: an operation with no `operationId`, no summary, a
+description under 40 characters, or an undescribed parameter fails CI.
+
+## Two details worth knowing
+
+**Entity lists are summarised before they leave.** A full `/api/states` dump
+on a real installation is tens of thousands of tokens and would swamp the
+model's context. `list_home_entities` returns `entity_id`, friendly name and
+state only, filtered to the domains an assistant actually needs, capped at
+200. Noisy attributes (`icon`, `supported_features`, `*_modes`) are stripped
+from single-entity reads for the same reason.
+
+**Failures are legible.** An unreachable Home Assistant is a 503 saying so; a
+5xx from it is a 502 saying the request was not applied; an unknown entity
+answers with a sentence telling the model to search first. A bare traceback
+would tell the model nothing.
 
 ## Google Calendar
 
-A service account cannot reach a personal calendar, so the harness uses a user
+A service account cannot reach a personal calendar, so this uses a user
 refresh token. Once, on a machine with a browser:
 
 ```bash
 python3 scripts/google_oauth.py --client-id ... --client-secret ...
 ```
 
-It prints the three values to put into the deployment secret. Setup steps for
-the Google Cloud side are in the script's docstring.
+It prints the three values to put in the deployment secret. The Google Cloud
+setup steps are in the script's docstring.
+
+## Running it locally
+
+```bash
+cp .env.example .env
+set -a && . ./.env && set +a
+pip install -r harness/requirements.txt
+cd harness/app && uvicorn main:app --reload --port 8080
+```
+
+Then browse http://localhost:8080/docs for the interactive spec.
 
 ## Tests
 
@@ -140,6 +112,12 @@ the Google Cloud side are in the script's docstring.
 python harness/tests/test_harness.py
 ```
 
-Covers the fallback router, the tool loop (including parallel calls, tool
-failures and the iteration cap), history repair, and each adapter's wire
-format. No network, no API keys, standard library only.
+33 tests, standard library plus the app's own dependencies. Home Assistant and
+Google are stubbed with `httpx.MockTransport` — **no network, no
+credentials**.
+
+They cover two things: that the tools behave (filtering, attribute stripping,
+payload shapes, percent-encoded calendar ids, token caching, degraded
+configuration), and that **the OpenAPI contract holds** — unique operation
+ids, described parameters, and all nine tools present even when a credential
+is missing, so Open WebUI's registration never silently loses half of them.

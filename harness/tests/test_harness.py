@@ -1,494 +1,422 @@
-"""Tests for the provider-neutral core.
+"""Tests for the tool server.
 
-Standard-library unittest so the test run needs nothing beyond the app's own
-dependencies. Run from the repo root:
+Home Assistant and Google are stubbed with httpx.MockTransport, so the whole
+suite runs with no network and no credentials.
+
+Two things are being protected here:
+
+  1. behaviour — the tools do the right thing, and fail in a way the model
+     can recover from;
+  2. the OpenAPI spec — Open WebUI turns it into the tool definitions the
+     model reads, so a missing operationId or description is a real defect,
+     not a documentation nit.
 
     python harness/tests/test_harness.py
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 APP = Path(__file__).resolve().parents[1] / "app"
 sys.path.insert(0, str(APP))
 
-from agent import Agent  # noqa: E402
-from config import RouteConfig, Settings  # noqa: E402
-from llm import Router, split_ref  # noqa: E402
-from memory import Memory, _repair  # noqa: E402
-from provider_anthropic import AnthropicProvider  # noqa: E402
-from provider_base import (  # noqa: E402
-    Completion,
-    Message,
-    ProviderError,
-    Text,
-    ToolResult,
-    ToolSpec,
-    ToolUse,
-    Usage,
+import httpx  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+os.environ.update(
+    HA_URL="http://ha.test:8123",
+    HA_TOKEN="ha-token",
+    GOOGLE_CLIENT_ID="cid",
+    GOOGLE_CLIENT_SECRET="csecret",
+    GOOGLE_REFRESH_TOKEN="rtoken",
+    GOOGLE_CALENDAR_ID="primary",
+    TOOLS_API_KEY="test-key",
+    TZ="Europe/Madrid",
 )
-from provider_google import GoogleProvider, _clean_schema  # noqa: E402
-from provider_openai import OpenAICompatProvider  # noqa: E402
-from tool_registry import ToolRegistry, obj, string  # noqa: E402
+
+import main  # noqa: E402
+import tool_calendar  # noqa: E402
+import tool_homeassistant  # noqa: E402
+from config import Settings  # noqa: E402
+from google_auth import GoogleAuth  # noqa: E402
+
+AUTH = {"X-API-Key": "test-key"}
+
+STATES = [
+    {"entity_id": "light.kitchen", "state": "on",
+     "attributes": {"friendly_name": "Kitchen", "brightness": 180, "icon": "mdi:bulb"}},
+    {"entity_id": "light.hall", "state": "off",
+     "attributes": {"friendly_name": "Hallway"}},
+    {"entity_id": "sensor.outside_temp", "state": "12.4",
+     "attributes": {"friendly_name": "Outside temperature", "unit_of_measurement": "°C"}},
+    {"entity_id": "person.fran", "state": "home", "attributes": {"friendly_name": "Fran"}},
+    # Not in INTERESTING_DOMAINS, so it must not appear in an unfiltered list.
+    {"entity_id": "update.core", "state": "off", "attributes": {"friendly_name": "Core update"}},
+]
 
 
-class StubProvider:
-    """Returns a scripted sequence of Completions and records what it was sent."""
+class FakeHome:
+    def __init__(self):
+        self.requests: list[httpx.Request] = []
+        self.fail_with: int | None = None
 
-    def __init__(self, script, slug="stub"):
-        self.script = list(script)
-        self.slug = slug
-        self.calls = []
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        if self.fail_with:
+            return httpx.Response(self.fail_with, text="home assistant said no")
+        p = request.url.path
+        if p == "/api/states":
+            return httpx.Response(200, json=STATES)
+        if p.startswith("/api/states/"):
+            wanted = p.rsplit("/", 1)[-1]
+            for s in STATES:
+                if s["entity_id"] == wanted:
+                    return httpx.Response(200, json={**s, "last_changed": "2026-08-30T10:00:00Z"})
+            return httpx.Response(404, text="Entity not found")
+        if p.startswith("/api/services/"):
+            return httpx.Response(200, json=[{"entity_id": "light.kitchen", "state": "off"}])
+        if p == "/api/conversation/process":
+            return httpx.Response(200, json={
+                "response": {"speech": {"plain": {"speech": "Turned off 3 lights"}}}
+            })
+        return httpx.Response(404, text=f"no stub for {p}")
 
-    async def complete(self, **kw):
-        self.calls.append(kw)
-        result = self.script.pop(0)
-        if isinstance(result, Exception):
-            raise result
-        return result
+    def body(self, path_suffix: str) -> dict:
+        for r in reversed(self.requests):
+            if r.url.path.endswith(path_suffix):
+                return json.loads(r.content)
+        raise AssertionError(f"no request ending in {path_suffix}")
 
 
-class StubGateway:
-    """Captures the request body an adapter builds, without any network."""
+class FakeGoogle:
+    def __init__(self):
+        self.requests: list[httpx.Request] = []
+        self.events = [
+            {"id": "ev1", "summary": "Dentist",
+             "start": {"dateTime": "2026-09-02T18:00:00+02:00"},
+             "end": {"dateTime": "2026-09-02T19:00:00+02:00"},
+             "location": "Clinic"},
+            {"id": "ev2", "summary": "Holiday", "start": {"date": "2026-09-05"},
+             "end": {"date": "2026-09-06"}},
+        ]
+        self.token_calls = 0
 
-    def __init__(self, response=None):
-        self.response = response or {}
-        self.last = None
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        url = str(request.url)
+        if "oauth2.googleapis.com/token" in url:
+            self.token_calls += 1
+            return httpx.Response(200, json={"access_token": "at-123", "expires_in": 3600})
+        p = request.url.path
+        if p.endswith("/calendarList"):
+            return httpx.Response(200, json={"items": [
+                {"id": "primary", "summary": "Fran", "primary": True, "accessRole": "owner"}
+            ]})
+        if p.endswith("/events") and request.method == "GET":
+            return httpx.Response(200, json={"items": self.events})
+        if p.endswith("/events") and request.method == "POST":
+            body = json.loads(request.content)
+            return httpx.Response(200, json={"id": "new1", **body})
+        if request.method == "PATCH":
+            return httpx.Response(200, json={"id": "ev1", "summary": "Moved",
+                                             "start": {"dateTime": "2026-09-03T10:00:00"}})
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        return httpx.Response(404, text=f"no stub for {p}")
 
-    async def post_json(self, provider, path, *, headers, json, cache=True):
-        self.last = {"provider": provider, "path": path, "headers": headers, "json": json}
-        return self.response
+    def last(self, method: str) -> httpx.Request:
+        for r in reversed(self.requests):
+            if r.method == method and "oauth2" not in str(r.url):
+                return r
+        raise AssertionError(f"no {method} request")
 
 
-# ---------------------------------------------------------------------------
+class ToolServerTest(unittest.TestCase):
+    """Boots the app with both upstreams stubbed."""
 
+    def setUp(self):
+        self.home = FakeHome()
+        self.google = FakeGoogle()
 
-class TestModelRefs(unittest.TestCase):
-    def test_simple(self):
-        self.assertEqual(split_ref("anthropic/claude-opus-5"), ("anthropic", "claude-opus-5"))
-
-    def test_openrouter_keeps_its_own_slashes(self):
-        self.assertEqual(
-            split_ref("openrouter/meta-llama/llama-3.3-70b-instruct"),
-            ("openrouter", "meta-llama/llama-3.3-70b-instruct"),
+        s = Services = main.Services.__new__(main.Services)
+        s.settings = Settings()
+        s.ha = tool_homeassistant.HomeAssistant(
+            "http://ha.test:8123", "ha-token",
+            transport=httpx.MockTransport(self.home.handler),
         )
-
-    def test_workers_ai_model_id(self):
-        self.assertEqual(
-            split_ref("workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast"),
-            ("workers-ai", "@cf/meta/llama-3.3-70b-instruct-fp8-fast"),
+        s.google_auth = GoogleAuth(
+            "cid", "csecret", "rtoken",
+            transport=httpx.MockTransport(self.google.handler),
         )
-
-    def test_missing_provider_is_rejected(self):
-        with self.assertRaises(ProviderError):
-            split_ref("claude-opus-5")
-
-
-class TestRouterFallback(unittest.IsolatedAsyncioTestCase):
-    def _settings(self):
-        os.environ["HARNESS_ROUTES"] = "/nonexistent"
-        return Settings()
-
-    async def test_falls_back_when_primary_is_retryable(self):
-        primary = StubProvider([ProviderError("rate limited", status=429, retryable=True)])
-        fallback = StubProvider([Completion(text="from the fallback")])
-        router = Router(self._settings(), {"a": primary, "b": fallback})
-
-        result = await router.complete(
-            RouteConfig(primary="a/m1", fallback="b/m2"),
-            system="s", messages=[Message.user("hi")], tools=[],
+        s.calendar = tool_calendar.Calendar(
+            s.google_auth, "primary", "Europe/Madrid",
+            transport=httpx.MockTransport(self.google.handler),
         )
-        self.assertEqual(result.text, "from the fallback")
-        self.assertEqual(len(fallback.calls), 1)
+        main.services = s
+        self.services = s
+        self.client = TestClient(main.app)
 
-    async def test_does_not_fall_back_on_a_bad_request(self):
-        # A 400 means we built the request wrong; the fallback would fail too.
-        primary = StubProvider([ProviderError("bad request", status=400, retryable=False)])
-        fallback = StubProvider([Completion(text="should not be reached")])
-        router = Router(self._settings(), {"a": primary, "b": fallback})
+    def tearDown(self):
+        main.services = None
 
-        with self.assertRaises(ProviderError):
-            await router.complete(
-                RouteConfig(primary="a/m1", fallback="b/m2"),
-                system="s", messages=[Message.user("hi")], tools=[],
+
+class TestOpenAPIContract(ToolServerTest):
+    """The spec IS the tool definition Open WebUI hands to the model."""
+
+    def setUp(self):
+        super().setUp()
+        self.spec = self.client.get("/openapi.json").json()
+
+    def _operations(self):
+        methods = {"get", "post", "put", "patch", "delete"}
+        for path, item in self.spec["paths"].items():
+            for method, op in item.items():
+                if method in methods:
+                    yield path, method, op
+
+    def test_spec_is_openapi_3_x(self):
+        # Open WebUI parses against the OpenAPI 3.x path-item model.
+        self.assertTrue(self.spec["openapi"].startswith("3."))
+
+    def test_every_operation_has_a_stable_unique_id(self):
+        ids = [op["operationId"] for _, _, op in self._operations()]
+        self.assertEqual(len(ids), len(set(ids)), "operationId must be unique")
+        # Auto-generated ids are unreadable; these become the tool names.
+        for i in ids:
+            self.assertNotIn("__", i, f"{i} looks auto-generated")
+
+    def test_every_operation_is_described_for_the_model(self):
+        for path, method, op in self._operations():
+            where = f"{method.upper()} {path}"
+            self.assertTrue(op.get("summary"), f"{where} has no summary")
+            self.assertGreater(
+                len(op.get("description", "")), 40,
+                f"{where} needs a description the model can act on",
             )
-        self.assertEqual(fallback.calls, [])
 
-    async def test_unknown_provider_is_skipped_not_fatal(self):
-        fallback = StubProvider([Completion(text="ok")])
-        router = Router(self._settings(), {"b": fallback})
-        result = await router.complete(
-            RouteConfig(primary="ghost/m1", fallback="b/m2"),
-            system="s", messages=[Message.user("hi")], tools=[],
+    def test_every_parameter_is_described(self):
+        for path, method, op in self._operations():
+            for param in op.get("parameters", []):
+                self.assertTrue(
+                    param.get("description"),
+                    f"{method.upper()} {path} parameter {param['name']} has no description",
+                )
+
+    def test_request_body_fields_are_described(self):
+        # FastAPI generates HTTPValidationError/ValidationError itself; only
+        # the models we author become tool arguments.
+        ours = {"ServiceCall", "Phrase", "NewEvent", "EventPatch"}
+        for name, schema in self.spec.get("components", {}).get("schemas", {}).items():
+            if name not in ours:
+                continue
+            for field, spec in (schema.get("properties") or {}).items():
+                self.assertTrue(
+                    spec.get("description"), f"{name}.{field} has no description"
+                )
+
+    def test_the_expected_nine_tools_are_exposed(self):
+        self.assertEqual(
+            sorted(op["operationId"] for _, _, op in self._operations()),
+            sorted([
+                "ask_home_assistant", "control_home_device", "create_calendar_event",
+                "delete_calendar_event", "get_home_entity_state", "list_calendar_events",
+                "list_calendars", "list_home_entities", "update_calendar_event",
+            ]),
         )
-        self.assertEqual(result.text, "ok")
+
+    def test_health_is_not_offered_as_a_tool(self):
+        self.assertNotIn("/health", self.spec["paths"])
 
 
-class TestAgentLoop(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        os.environ["HARNESS_ROUTES"] = "/nonexistent"
-        self.tmp = tempfile.TemporaryDirectory()
-        self.settings = Settings()
-        self.settings.db_path = str(Path(self.tmp.name) / "t.db")
-        self.memory = Memory(self.settings.db_path)
-        self.registry = ToolRegistry()
-        self.invoked = []
+class TestAuth(ToolServerTest):
+    def test_health_is_open(self):
+        r = self.client.get("/health")
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()["home_assistant"]["enabled"])
 
-        async def fake_light(entity_id: str):
-            self.invoked.append(entity_id)
-            return "off"
+    def test_the_spec_is_readable_without_a_key(self):
+        # Open WebUI fetches the spec before it has anywhere to put a key.
+        self.assertEqual(self.client.get("/openapi.json").status_code, 200)
 
-        self.registry.add(
-            "ha_call_service", "turn things off",
-            obj({"entity_id": string("id")}, ["entity_id"]), fake_light,
+    def test_tools_require_a_key(self):
+        self.assertEqual(self.client.get("/ha/entities").status_code, 401)
+
+    def test_bearer_is_accepted(self):
+        r = self.client.get("/ha/entities", headers={"Authorization": "Bearer test-key"})
+        self.assertEqual(r.status_code, 200)
+
+    def test_wrong_key_is_rejected(self):
+        r = self.client.get("/ha/entities", headers={"X-API-Key": "nope"})
+        self.assertEqual(r.status_code, 401)
+
+
+class TestHomeAssistantTools(ToolServerTest):
+    def test_listing_hides_noisy_domains_by_default(self):
+        rows = json.loads(self.client.get("/ha/entities", headers=AUTH).json()["result"])
+        ids = [r["entity_id"] for r in rows]
+        self.assertIn("light.kitchen", ids)
+        self.assertIn("person.fran", ids)
+        # update.* is not in INTERESTING_DOMAINS.
+        self.assertNotIn("update.core", ids)
+
+    def test_domain_filter(self):
+        rows = json.loads(
+            self.client.get("/ha/entities?domain=light", headers=AUTH).json()["result"]
         )
+        self.assertEqual({r["entity_id"].split(".")[0] for r in rows}, {"light"})
 
-    async def asyncTearDown(self):
-        self.tmp.cleanup()
-
-    def _agent(self, script):
-        provider = StubProvider(script)
-        router = Router(self.settings, {"stub": provider})
-        self.settings._raw_routes = {
-            "routes": {"chat": {"primary": "stub/m", "fallback": ""}}
-        }
-        agent = Agent(
-            settings=self.settings, router=router,
-            registry=self.registry, memory=self.memory,
+    def test_search_matches_the_friendly_name_not_just_the_id(self):
+        rows = json.loads(
+            self.client.get("/ha/entities?search=hallway", headers=AUTH).json()["result"]
         )
-        return agent, provider
+        self.assertEqual([r["entity_id"] for r in rows], ["light.hall"])
 
-    async def test_tool_call_then_answer(self):
-        agent, provider = self._agent([
-            Completion(
-                text="", stop_reason="tool_use",
-                tool_calls=[ToolUse("t1", "ha_call_service", {"entity_id": "light.kitchen"})],
-                usage=Usage(10, 5),
-            ),
-            Completion(text="Kitchen light is off.", usage=Usage(20, 8)),
-        ])
-        result = await agent.run("turn off the kitchen light", session_id="s1")
+    def test_an_explicit_domain_can_reach_past_the_default_filter(self):
+        rows = json.loads(
+            self.client.get("/ha/entities?domain=update", headers=AUTH).json()["result"]
+        )
+        self.assertEqual([r["entity_id"] for r in rows], ["update.core"])
 
-        self.assertEqual(result.text, "Kitchen light is off.")
-        self.assertEqual(self.invoked, ["light.kitchen"])
-        # Usage accumulates across every hop of the loop.
-        self.assertEqual(result.usage.input_tokens, 30)
-        self.assertEqual(result.usage.output_tokens, 13)
-        self.assertEqual(result.tool_calls[0]["name"], "ha_call_service")
-        self.assertTrue(result.tool_calls[0]["ok"])
+    def test_no_match_says_so_in_words_the_model_can_use(self):
+        result = self.client.get("/ha/entities?search=zzz", headers=AUTH).json()["result"]
+        self.assertIn("No matching entities", result)
 
-        # The second request must carry the tool result back to the model.
-        second = provider.calls[1]["messages"]
-        results = [b for m in second for b in m.content if isinstance(b, ToolResult)]
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0].content, "off")
+    def test_state_strips_attributes_that_only_cost_tokens(self):
+        state = json.loads(
+            self.client.get("/ha/entities/light.kitchen", headers=AUTH).json()["result"]
+        )
+        self.assertEqual(state["state"], "on")
+        self.assertEqual(state["attributes"]["brightness"], 180)
+        self.assertNotIn("icon", state["attributes"])
 
-    async def test_tool_failure_is_reported_to_the_model_not_raised(self):
-        async def boom():
-            raise RuntimeError("HA unreachable")
+    def test_an_unknown_entity_tells_the_model_how_to_recover(self):
+        result = self.client.get("/ha/entities/light.nope", headers=AUTH).json()["result"]
+        self.assertIn("No entity called", result)
+        self.assertIn("list_entities", result.replace("ha_", ""))
 
-        self.registry.add("broken", "fails", obj({}), boom)
-        agent, provider = self._agent([
-            Completion(text="", stop_reason="tool_use",
-                       tool_calls=[ToolUse("t1", "broken", {})]),
-            Completion(text="I could not reach Home Assistant."),
-        ])
-        result = await agent.run("do it", session_id="s2")
-
-        self.assertIn("could not reach", result.text)
-        self.assertFalse(result.tool_calls[0]["ok"])
-        second = provider.calls[1]["messages"]
-        errors = [b for m in second for b in m.content
-                  if isinstance(b, ToolResult) and b.is_error]
-        self.assertEqual(len(errors), 1)
-        self.assertIn("HA unreachable", errors[0].content)
-
-    async def test_unknown_tool_does_not_kill_the_turn(self):
-        agent, _ = self._agent([
-            Completion(text="", stop_reason="tool_use",
-                       tool_calls=[ToolUse("t1", "no_such_tool", {})]),
-            Completion(text="That is not something I can do."),
-        ])
-        result = await agent.run("x", session_id="s3")
-        self.assertEqual(result.text, "That is not something I can do.")
-        self.assertFalse(result.tool_calls[0]["ok"])
-
-    async def test_parallel_tool_calls_return_in_one_message(self):
-        agent, provider = self._agent([
-            Completion(
-                text="", stop_reason="tool_use",
-                tool_calls=[
-                    ToolUse("t1", "ha_call_service", {"entity_id": "light.a"}),
-                    ToolUse("t2", "ha_call_service", {"entity_id": "light.b"}),
-                ],
-            ),
-            Completion(text="Both off."),
-        ])
-        await agent.run("both", session_id="s4")
-
-        self.assertEqual(sorted(self.invoked), ["light.a", "light.b"])
-        second = provider.calls[1]["messages"]
-        result_msgs = [m for m in second
-                       if any(isinstance(b, ToolResult) for b in m.content)]
-        self.assertEqual(len(result_msgs), 1, "results must be batched into one message")
-        self.assertEqual(len(result_msgs[0].content), 2)
-
-    async def test_iteration_limit_is_enforced(self):
-        self.settings.max_tool_iterations = 3
-        loop = [
-            Completion(text="", stop_reason="tool_use",
-                       tool_calls=[ToolUse(f"t{i}", "ha_call_service",
-                                           {"entity_id": "light.x"})])
-            for i in range(3)
-        ]
-        agent, provider = self._agent(loop)
-        result = await agent.run("spin", session_id="s5")
-        self.assertEqual(len(provider.calls), 3)
-        self.assertIn("narrow down", result.text)
-
-    async def test_history_persists_across_turns(self):
-        agent, provider = self._agent([
-            Completion(text="Hello."),
-            Completion(text="Still here."),
-        ])
-        await agent.run("hi", session_id="s6")
-        await agent.run("again", session_id="s6")
-
-        second = provider.calls[1]["messages"]
-        # first user, first assistant, second user
-        self.assertEqual(len(second), 3)
-        self.assertEqual(second[0].content[0].text, "hi")
-        self.assertEqual(second[1].role, "assistant")
-
-
-class TestMemoryRepair(unittest.TestCase):
-    def test_drops_leading_orphan_tool_result(self):
-        msgs = [
-            Message(role="user", content=[ToolResult("t1", "orphan")]),
-            Message(role="assistant", content=[Text("a")]),
-            Message(role="user", content=[Text("b")]),
-        ]
-        repaired = _repair(msgs)
-        self.assertEqual(len(repaired), 1)
-        self.assertEqual(repaired[0].content[0].text, "b")
-
-    def test_drops_trailing_unanswered_tool_use(self):
-        msgs = [
-            Message(role="user", content=[Text("q")]),
-            Message(role="assistant", content=[ToolUse("t1", "x", {})]),
-        ]
-        repaired = _repair(msgs)
-        self.assertEqual(len(repaired), 1)
-        self.assertEqual(repaired[0].role, "user")
-
-    def test_leaves_a_clean_history_alone(self):
-        msgs = [
-            Message(role="user", content=[Text("q")]),
-            Message(role="assistant", content=[Text("a")]),
-        ]
-        self.assertEqual(len(_repair(list(msgs))), 2)
-
-
-class TestAnthropicAdapter(unittest.IsolatedAsyncioTestCase):
-    async def test_builds_native_messages_request(self):
-        gw = StubGateway({
-            "content": [
-                {"type": "text", "text": "hi there"},
-                {"type": "tool_use", "id": "tu1", "name": "f", "input": {"a": 1}},
-            ],
-            "stop_reason": "tool_use",
-            "usage": {"input_tokens": 7, "output_tokens": 3},
-            "model": "claude-opus-5",
+    def test_calling_a_service_sends_the_right_payload(self):
+        r = self.client.post("/ha/service", headers=AUTH, json={
+            "domain": "light", "service": "turn_off", "entity_id": "light.kitchen",
         })
-        p = AnthropicProvider(gw, "sk-test")
-        out = await p.complete(
-            model="claude-opus-5", system="be brief",
-            messages=[Message.user("hello")],
-            tools=[ToolSpec("f", "does f", {"type": "object", "properties": {}})],
-            max_tokens=100, temperature=0.5,
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.home.body("/turn_off"), {"entity_id": "light.kitchen"})
+
+    def test_service_data_is_merged_into_the_payload(self):
+        self.client.post("/ha/service", headers=AUTH, json={
+            "domain": "light", "service": "turn_on", "entity_id": "light.kitchen",
+            "data": {"brightness_pct": 40},
+        })
+        self.assertEqual(
+            self.home.body("/turn_on"),
+            {"entity_id": "light.kitchen", "brightness_pct": 40},
         )
 
-        body = gw.last["json"]
-        self.assertEqual(gw.last["path"], "v1/messages")
-        self.assertEqual(gw.last["headers"]["x-api-key"], "sk-test")
-        self.assertEqual(gw.last["headers"]["anthropic-version"], "2023-06-01")
-        self.assertEqual(body["system"], "be brief")
-        # Anthropic names the tool schema field input_schema.
-        self.assertIn("input_schema", body["tools"][0])
-        # Opus 5 rejects sampling params, so they must be dropped silently.
-        self.assertNotIn("temperature", body)
+    def test_conversation_returns_the_spoken_reply(self):
+        r = self.client.post("/ha/conversation", headers=AUTH,
+                             json={"text": "turn off everything downstairs"})
+        self.assertEqual(r.json()["result"], "Turned off 3 lights")
 
-        self.assertEqual(out.text, "hi there")
-        self.assertEqual(out.tool_calls[0].name, "f")
-        self.assertEqual(out.usage.input_tokens, 7)
+    def test_an_upstream_failure_is_a_5xx_not_a_silent_success(self):
+        self.home.fail_with = 500
+        r = self.client.get("/ha/entities", headers=AUTH)
+        self.assertGreaterEqual(r.status_code, 500)
 
-    async def test_keeps_temperature_for_a_model_that_accepts_it(self):
-        gw = StubGateway({"content": [{"type": "text", "text": "x"}],
-                          "stop_reason": "end_turn", "usage": {}})
-        await AnthropicProvider(gw, "k").complete(
-            model="claude-haiku-4-5", system="", messages=[Message.user("h")],
-            tools=[], max_tokens=10, temperature=0.2,
+
+class TestCalendarTools(ToolServerTest):
+    def test_listing_summarises_events(self):
+        rows = json.loads(
+            self.client.get("/calendar/events", headers=AUTH).json()["result"]
         )
-        self.assertEqual(gw.last["json"]["temperature"], 0.2)
+        self.assertEqual(rows[0]["summary"], "Dentist")
+        self.assertEqual(rows[0]["id"], "ev1")
+        self.assertTrue(rows[1]["all_day"])
 
-    async def test_refusal_becomes_a_retryable_error(self):
-        gw = StubGateway({
-            "content": [], "stop_reason": "refusal",
-            "stop_details": {"type": "refusal", "category": "cyber"},
+    def test_the_window_is_sent_to_google(self):
+        self.client.get("/calendar/events?days_ahead=3", headers=AUTH)
+        params = self.google.last("GET").url.params
+        self.assertEqual(params["singleEvents"], "true")
+        self.assertEqual(params["orderBy"], "startTime")
+        self.assertEqual(params["timeZone"], "Europe/Madrid")
+
+    def test_creating_defaults_to_a_one_hour_event(self):
+        r = self.client.post("/calendar/events", headers=AUTH, json={
+            "summary": "Dentist", "start": "2026-09-02T18:00:00",
         })
-        with self.assertRaises(ProviderError) as ctx:
-            await AnthropicProvider(gw, "k").complete(
-                model="claude-opus-5", system="", messages=[Message.user("h")],
-                tools=[], max_tokens=10,
-            )
-        self.assertTrue(ctx.exception.retryable)
+        self.assertEqual(r.status_code, 200)
+        body = json.loads(self.google.last("POST").content)
+        self.assertEqual(body["start"]["dateTime"], "2026-09-02T18:00:00")
+        self.assertEqual(body["end"]["dateTime"], "2026-09-02T19:00:00")
 
-    async def test_route_options_reach_the_wire(self):
-        gw = StubGateway({"content": [{"type": "text", "text": "x"}],
-                          "stop_reason": "end_turn", "usage": {}})
-        p = AnthropicProvider(gw, "k", options={"thinking": "adaptive", "effort": "low"})
-        await p.complete(model="claude-opus-5", system="", messages=[Message.user("h")],
-                         tools=[], max_tokens=10)
-        self.assertEqual(gw.last["json"]["thinking"], {"type": "adaptive"})
-        self.assertEqual(gw.last["json"]["output_config"], {"effort": "low"})
-
-    async def test_missing_key_is_not_retryable(self):
-        with self.assertRaises(ProviderError) as ctx:
-            await AnthropicProvider(StubGateway(), "").complete(
-                model="m", system="", messages=[], tools=[], max_tokens=1)
-        self.assertFalse(ctx.exception.retryable)
-
-
-class TestOpenAIAdapter(unittest.IsolatedAsyncioTestCase):
-    async def test_tool_results_become_role_tool_messages(self):
-        gw = StubGateway({
-            "choices": [{"message": {"content": "done", "tool_calls": None},
-                         "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 4, "completion_tokens": 2},
+    def test_an_all_day_event_uses_dates_not_datetimes(self):
+        self.client.post("/calendar/events", headers=AUTH, json={
+            "summary": "Holiday", "start": "2026-09-05", "all_day": True,
         })
-        p = OpenAICompatProvider(gw, "sk-x", slug="openai")
-        await p.complete(
-            model="gpt-4o", system="sys",
-            messages=[
-                Message.user("q"),
-                Message(role="assistant", content=[ToolUse("c1", "f", {"a": 1})]),
-                Message(role="user", content=[ToolResult("c1", "42")]),
-            ],
-            tools=[ToolSpec("f", "d", {"type": "object", "properties": {}})],
-            max_tokens=50,
+        body = json.loads(self.google.last("POST").content)
+        self.assertEqual(body["start"], {"date": "2026-09-05"})
+        self.assertNotIn("dateTime", body["start"])
+
+    def test_updating_sends_only_the_changed_fields(self):
+        self.client.patch("/calendar/events/ev1", headers=AUTH,
+                          json={"summary": "Moved"})
+        body = json.loads(self.google.last("PATCH").content)
+        self.assertEqual(list(body), ["summary"])
+
+    def test_updating_nothing_is_refused_rather_than_sent(self):
+        r = self.client.patch("/calendar/events/ev1", headers=AUTH, json={})
+        self.assertIn("Nothing to update", r.json()["result"])
+
+    def test_deleting_reaches_google(self):
+        r = self.client.delete("/calendar/events/ev1", headers=AUTH)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.google.last("DELETE").method, "DELETE")
+
+    def test_a_calendar_id_with_an_at_sign_is_percent_encoded(self):
+        self.client.get(
+            "/calendar/events?calendar_id=fran%40gmail.com", headers=AUTH
         )
-        wire = gw.last["json"]["messages"]
-        self.assertEqual(wire[0]["role"], "system")
-        # The assistant turn carries tool_calls with JSON-string arguments.
-        assistant = wire[2]
-        self.assertEqual(assistant["tool_calls"][0]["function"]["arguments"], '{"a": 1}')
-        # The result becomes its own role:"tool" message keyed by call id.
-        self.assertEqual(wire[3]["role"], "tool")
-        self.assertEqual(wire[3]["tool_call_id"], "c1")
-        # OpenAI nests the schema under function.parameters.
-        self.assertIn("parameters", gw.last["json"]["tools"][0]["function"])
+        self.assertIn("fran%40gmail.com", str(self.google.last("GET").url))
 
-    async def test_parses_tool_calls_and_bad_json_arguments(self):
-        gw = StubGateway({
-            "choices": [{
-                "message": {"content": None, "tool_calls": [
-                    {"id": "c1", "function": {"name": "f", "arguments": '{"a": 1}'}},
-                    {"id": "c2", "function": {"name": "g", "arguments": "not json"}},
-                ]},
-                "finish_reason": "tool_calls",
-            }],
-            "usage": {},
-        })
-        out = await OpenAICompatProvider(gw, "k").complete(
-            model="m", system="", messages=[Message.user("x")], tools=[], max_tokens=10)
-        self.assertEqual(out.tool_calls[0].input, {"a": 1})
-        # Malformed arguments must not crash the turn.
-        self.assertEqual(out.tool_calls[1].input, {})
+    def test_the_access_token_is_reused_across_calls(self):
+        self.client.get("/calendar/events", headers=AUTH)
+        self.client.get("/calendar/calendars", headers=AUTH)
+        self.assertEqual(self.google.token_calls, 1, "token should be cached")
 
 
-class TestGoogleAdapter(unittest.IsolatedAsyncioTestCase):
-    def test_schema_cleaning_strips_unsupported_keywords(self):
-        cleaned = _clean_schema({
-            "type": "object",
-            "additionalProperties": False,
-            "$schema": "http://json-schema.org/draft-07/schema#",
-            "properties": {"a": {"type": "string", "default": "", "description": "d"}},
-            "required": ["a"],
-        })
-        self.assertNotIn("additionalProperties", cleaned)
-        self.assertNotIn("$schema", cleaned)
-        self.assertNotIn("default", cleaned["properties"]["a"])
-        self.assertEqual(cleaned["properties"]["a"]["description"], "d")
-        self.assertEqual(cleaned["required"], ["a"])
+class TestDegradedConfiguration(unittest.TestCase):
+    """A missing credential must be a clear 503, not a crash at import."""
 
-    async def test_roles_and_function_calls(self):
-        gw = StubGateway({
-            "candidates": [{
-                "content": {"parts": [
-                    {"text": "sure"},
-                    {"functionCall": {"name": "f", "args": {"a": 1}}},
-                ]},
-                "finishReason": "STOP",
-            }],
-            "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 1},
-        })
-        p = GoogleProvider(gw, "AIza-test")
-        out = await p.complete(
-            model="gemini-2.0-flash", system="sys",
-            messages=[Message.user("q"), Message.assistant("a")],
-            tools=[ToolSpec("f", "d", {"type": "object", "properties": {}})],
-            max_tokens=64,
-        )
-        body = gw.last["json"]
-        self.assertEqual(gw.last["path"], "v1beta/models/gemini-2.0-flash:generateContent")
-        self.assertEqual(gw.last["headers"]["x-goog-api-key"], "AIza-test")
-        self.assertEqual(body["system_instruction"]["parts"][0]["text"], "sys")
-        # Gemini calls the assistant role "model".
-        self.assertEqual(body["contents"][1]["role"], "model")
-        self.assertIn("function_declarations", body["tools"][0])
-        self.assertEqual(out.text, "sure")
-        self.assertEqual(out.tool_calls[0].name, "f")
+    def test_unconfigured_tools_report_why(self):
+        s = main.Services.__new__(main.Services)
+        s.settings = Settings()
+        s.ha = None
+        s.calendar = None
+        s.google_auth = None
+        main.services = s
+        try:
+            client = TestClient(main.app)
+            r = client.get("/ha/entities", headers=AUTH)
+            self.assertEqual(r.status_code, 503)
+            self.assertIn("not configured", r.json()["detail"])
 
-    async def test_tool_result_round_trips_by_name(self):
-        gw = StubGateway({"candidates": [{"content": {"parts": [{"text": "ok"}]},
-                                          "finishReason": "STOP"}]})
-        await GoogleProvider(gw, "k").complete(
-            model="m", system="",
-            messages=[
-                Message.user("q"),
-                Message(role="assistant", content=[ToolUse("myfunc:0", "myfunc", {})]),
-                Message(role="user", content=[ToolResult("myfunc:0", "42")]),
-            ],
-            tools=[], max_tokens=10,
-        )
-        parts = gw.last["json"]["contents"][2]["parts"]
-        # Gemini matches results to calls by name, so the id must decode back.
-        self.assertEqual(parts[0]["functionResponse"]["name"], "myfunc")
+            r = client.get("/calendar/events", headers=AUTH)
+            self.assertEqual(r.status_code, 503)
 
-
-class TestToolRegistry(unittest.IsolatedAsyncioTestCase):
-    async def test_bad_arguments_are_reported_not_raised(self):
-        reg = ToolRegistry()
-
-        async def needs_id(entity_id: str):
-            return "ok"
-
-        reg.add("t", "d", obj({"entity_id": string("id")}, ["entity_id"]), needs_id)
-        out, err = await reg.invoke("t", {"wrong_arg": 1})
-        self.assertTrue(err)
-        self.assertIn("Invalid arguments", out)
-
-    async def test_sync_handlers_work_too(self):
-        reg = ToolRegistry()
-        reg.add("t", "d", obj({}), lambda: "sync result")
-        out, err = await reg.invoke("t", {})
-        self.assertFalse(err)
-        self.assertEqual(out, "sync result")
+            # The spec must still list every tool, so Open WebUI's registration
+            # does not silently lose half of them when a key is missing.
+            # 7 paths carry 9 operations: /calendar/events is GET+POST and
+            # /calendar/events/{id} is PATCH+DELETE.
+            spec = client.get("/openapi.json").json()
+            self.assertEqual(len(spec["paths"]), 7)
+            ops = [m for i in spec["paths"].values() for m in i
+                   if m in ("get", "post", "patch", "delete")]
+            self.assertEqual(len(ops), 9)
+        finally:
+            main.services = None
 
 
 if __name__ == "__main__":
