@@ -33,7 +33,13 @@ import webbrowser
 
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
-SCOPE = "https://www.googleapis.com/auth/calendar"
+# Space-separated. Adding a scope invalidates nothing, but a refresh token
+# minted before the scope existed will NOT gain it -- consent must be run
+# again, and Google only re-issues a refresh token with prompt=consent.
+SCOPE = " ".join((
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/tasks",
+))
 PORT = 8765
 REDIRECT_URI = f"http://localhost:{PORT}/callback"
 

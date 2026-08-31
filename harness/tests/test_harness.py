@@ -40,7 +40,8 @@ os.environ.update(
 )
 
 import main  # noqa: E402
-import tool_calendar  # noqa: E402
+import tool_calendar
+import tool_tasks  # noqa: E402
 import tool_homeassistant  # noqa: E402
 from config import Settings  # noqa: E402
 from google_auth import GoogleAuth  # noqa: E402
@@ -104,6 +105,13 @@ class FakeGoogle:
             {"id": "ev2", "summary": "Holiday", "start": {"date": "2026-09-05"},
              "end": {"date": "2026-09-06"}},
         ]
+        self.tasks = [
+            # Deliberately out of order and with one undated task, so the
+            # sort in tool_tasks is actually exercised.
+            {"id": "t2", "title": "Buy stamps", "status": "needsAction"},
+            {"id": "t1", "title": "Renew insurance", "status": "needsAction",
+             "due": "2026-09-04T00:00:00.000Z"},
+        ]
         self.token_calls = 0
 
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -113,6 +121,19 @@ class FakeGoogle:
             self.token_calls += 1
             return httpx.Response(200, json={"access_token": "at-123", "expires_in": 3600})
         p = request.url.path
+        if p.endswith("/users/@me/lists"):
+            return httpx.Response(200, json={"items": [
+                {"id": "@default", "title": "My Tasks"},
+                {"id": "list2", "title": "Shopping"},
+            ]})
+        if "/tasks/v1/lists/" in p and p.endswith("/tasks"):
+            if request.method == "GET":
+                return httpx.Response(200, json={"items": self.tasks})
+            body = json.loads(request.content)
+            return httpx.Response(200, json={"id": "t-new", **body})
+        if "/tasks/v1/lists/" in p and request.method == "PATCH":
+            return httpx.Response(200, json={"id": "t1", "title": "Renew insurance",
+                                             "status": "completed"})
         if p.endswith("/calendarList"):
             return httpx.Response(200, json={"items": [
                 {"id": "primary", "summary": "Fran", "primary": True, "accessRole": "owner"}
@@ -155,6 +176,10 @@ class ToolServerTest(unittest.TestCase):
         )
         s.calendar = tool_calendar.Calendar(
             s.google_auth, "primary", "Europe/Madrid",
+            transport=httpx.MockTransport(self.google.handler),
+        )
+        s.tasks = tool_tasks.Tasks(
+            s.google_auth, "@default", "Europe/Madrid",
             transport=httpx.MockTransport(self.google.handler),
         )
         main.services = s
@@ -219,13 +244,16 @@ class TestOpenAPIContract(ToolServerTest):
                     spec.get("description"), f"{name}.{field} has no description"
                 )
 
-    def test_the_expected_nine_tools_are_exposed(self):
+    def test_the_expected_tools_are_exposed(self):
+        # An inventory, deliberately explicit: a tool appearing or vanishing
+        # changes what the model can do, so it should never pass unnoticed.
         self.assertEqual(
             sorted(op["operationId"] for _, _, op in self._operations()),
             sorted([
                 "ask_home_assistant", "control_home_device", "create_calendar_event",
                 "delete_calendar_event", "get_home_entity_state", "list_calendar_events",
                 "list_calendars", "list_home_entities", "update_calendar_event",
+                "add_task", "complete_task", "list_task_lists", "list_tasks",
             ]),
         )
 
@@ -387,6 +415,46 @@ class TestCalendarTools(ToolServerTest):
         self.assertEqual(self.google.token_calls, 1, "token should be cached")
 
 
+class TestTaskTools(ToolServerTest):
+    def test_listing_puts_the_soonest_due_first_and_undated_last(self):
+        rows = json.loads(self.client.get("/tasks", headers=AUTH).json()["result"])
+        self.assertEqual([r["id"] for r in rows], ["t1", "t2"])
+        self.assertEqual(rows[0]["due"], "2026-09-04")
+        self.assertIsNone(rows[1]["due"])
+
+    def test_completed_tasks_are_hidden_unless_asked_for(self):
+        self.client.get("/tasks", headers=AUTH)
+        self.assertEqual(self.google.last("GET").url.params["showCompleted"], "false")
+        self.client.get("/tasks?include_completed=true", headers=AUTH)
+        params = self.google.last("GET").url.params
+        # showHidden must accompany showCompleted or Google filters them out
+        # again regardless.
+        self.assertEqual(params["showCompleted"], "true")
+        self.assertEqual(params["showHidden"], "true")
+
+    def test_a_due_time_is_reduced_to_a_date(self):
+        # Google Tasks stores no due time. Sending one and letting Google drop
+        # it silently would have the model promise the user an hour.
+        self.client.post("/tasks", headers=AUTH,
+                         json={"title": "Renew insurance", "due": "2026-09-04T17:30:00"})
+        body = json.loads(self.google.last("POST").content)
+        self.assertEqual(body["due"], "2026-09-04T00:00:00.000Z")
+
+    def test_adding_without_a_due_date_sends_none(self):
+        self.client.post("/tasks", headers=AUTH, json={"title": "Buy stamps"})
+        self.assertNotIn("due", json.loads(self.google.last("POST").content))
+
+    def test_completing_patches_the_status(self):
+        r = self.client.post("/tasks/t1/complete", headers=AUTH)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(json.loads(self.google.last("PATCH").content),
+                         {"status": "completed"})
+
+    def test_task_lists_are_listed_with_ids(self):
+        rows = json.loads(self.client.get("/tasks/lists", headers=AUTH).json()["result"])
+        self.assertEqual(rows[0], {"id": "@default", "name": "My Tasks"})
+
+
 class TestDegradedConfiguration(unittest.TestCase):
     """A missing credential must be a clear 503, not a crash at import."""
 
@@ -408,13 +476,13 @@ class TestDegradedConfiguration(unittest.TestCase):
 
             # The spec must still list every tool, so Open WebUI's registration
             # does not silently lose half of them when a key is missing.
-            # 7 paths carry 9 operations: /calendar/events is GET+POST and
-            # /calendar/events/{id} is PATCH+DELETE.
+            # 10 paths carry 13 operations: /calendar/events is GET+POST,
+            # /calendar/events/{id} is PATCH+DELETE, and /tasks is GET+POST.
             spec = client.get("/openapi.json").json()
-            self.assertEqual(len(spec["paths"]), 7)
+            self.assertEqual(len(spec["paths"]), 10)
             ops = [m for i in spec["paths"].values() for m in i
                    if m in ("get", "post", "patch", "delete")]
-            self.assertEqual(len(ops), 9)
+            self.assertEqual(len(ops), 13)
         finally:
             main.services = None
 

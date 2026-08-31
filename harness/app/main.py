@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 
 import tool_calendar
 import tool_homeassistant
+import tool_tasks
 from config import Settings
 from google_auth import GoogleAuth
 
@@ -44,6 +45,7 @@ class Services:
         self.settings = Settings()
         self.ha: tool_homeassistant.HomeAssistant | None = None
         self.calendar: tool_calendar.Calendar | None = None
+        self.tasks: tool_tasks.Tasks | None = None
         self.google_auth: GoogleAuth | None = None
 
         if self.settings.ha_enabled:
@@ -64,6 +66,11 @@ class Services:
                 self.google_auth, self.settings.calendar_id, self.settings.timezone
             )
             log.info("Google Calendar tools enabled (%s)", self.settings.calendar_id)
+        if self.settings.tasks_enabled:
+            self.tasks = tool_tasks.Tasks(
+                self.google_auth, self.settings.tasklist_id, self.settings.timezone
+            )
+            log.info("Google Tasks tools enabled (%s)", self.settings.tasklist_id)
         else:
             log.warning(
                 "Google Calendar tools disabled — run scripts/google_oauth.py "
@@ -75,6 +82,8 @@ class Services:
             await self.ha.aclose()
         if self.calendar:
             await self.calendar.aclose()
+        if self.tasks:
+            await self.tasks.aclose()
         if self.google_auth:
             await self.google_auth.aclose()
 
@@ -194,6 +203,15 @@ def cal() -> tool_calendar.Calendar:
             503, "Google Calendar is not configured on this server (no refresh token)"
         )
     return c
+
+
+def tasks() -> tool_tasks.Tasks:
+    t = svc().tasks
+    if t is None:
+        raise HTTPException(
+            503, "Google Tasks is not configured on this server (no refresh token)"
+        )
+    return t
 
 
 # ── health ───────────────────────────────────────────────────────────────
@@ -482,3 +500,119 @@ async def delete_calendar_event(
 )
 async def list_calendars() -> dict[str, Any]:
     return {"result": await cal().list_calendars()}
+
+
+# ── Google Tasks ─────────────────────────────────────────────────────────
+#
+# Same OAuth grant as the calendar. A refresh token minted before the tasks
+# scope was added returns 403 here while the calendar keeps working.
+
+
+class NewTask(BaseModel):
+    title: str = Field(
+        description="What needs doing, phrased as the user would say it.",
+        examples=["Renew the car insurance"],
+    )
+    due: str = Field(
+        default="",
+        description="Due DATE as ISO 8601, for example '2026-09-04'. Google "
+                    "Tasks stores no due time, so any time you send is "
+                    "discarded — do not promise the user a reminder at an "
+                    "hour. Resolve 'next Friday' yourself before calling.",
+        examples=["2026-09-04"],
+    )
+    notes: str = Field(default="", description="Longer notes attached to the task.")
+    list_id: str = Field(
+        default="", description="Task list id. Defaults to the user's default list."
+    )
+
+
+@app.get(
+    "/tasks",
+    operation_id="list_tasks",
+    summary="Look up the user's to-do list",
+    description=(
+        "Read outstanding tasks. Use this for anything about what the user has "
+        "to do, what is due, or what is outstanding. Returns each task's id, "
+        "title, due date and status. Completed tasks are excluded unless asked "
+        "for. Note that due dates have no time of day."
+    ),
+    dependencies=[Guarded],
+    tags=["Tasks"],
+)
+async def list_tasks(
+    due_within_days: Annotated[int, Query(
+        ge=0, le=365,
+        description="Only return tasks due within this many days. 0 means no "
+                    "due-date filter, which also includes tasks with no due date.",
+    )] = 0,
+    include_completed: Annotated[bool, Query(
+        description="Include tasks already ticked off. Normally false.",
+    )] = False,
+    list_id: Annotated[str, Query(
+        description="Task list id. Defaults to the user's default list.",
+    )] = "",
+    max_results: Annotated[int, Query(
+        ge=1, le=100, description="Maximum tasks to return.",
+    )] = 50,
+) -> dict[str, Any]:
+    return {"result": await tasks().list_tasks(
+        due_within_days=due_within_days,
+        include_completed=include_completed,
+        list_id=list_id,
+        max_results=max_results,
+    )}
+
+
+@app.post(
+    "/tasks",
+    operation_id="add_task",
+    summary="Add something to the user's to-do list",
+    description=(
+        "Create a task. Use this when the user says they need to do something, "
+        "or asks you to remember an errand. Prefer this over creating a "
+        "calendar event when there is no particular time involved."
+    ),
+    dependencies=[Guarded],
+    tags=["Tasks"],
+)
+async def add_task(body: NewTask) -> dict[str, Any]:
+    return {"result": await tasks().add_task(
+        title=body.title, due=body.due, notes=body.notes, list_id=body.list_id
+    )}
+
+
+@app.post(
+    "/tasks/{task_id}/complete",
+    operation_id="complete_task",
+    summary="Tick a task off the user's to-do list",
+    description=(
+        "Mark a task as done. Call list_tasks first to find the task id — "
+        "never guess one. Confirm with the user if more than one task could "
+        "plausibly be the one they meant."
+    ),
+    dependencies=[Guarded],
+    tags=["Tasks"],
+)
+async def complete_task(
+    task_id: Annotated[str, Path(description="Id of the task to mark done.")],
+    list_id: Annotated[str, Query(
+        description="Task list id. Defaults to the user's default list.",
+    )] = "",
+) -> dict[str, Any]:
+    return {"result": await tasks().complete_task(task_id=task_id, list_id=list_id)}
+
+
+@app.get(
+    "/tasks/lists",
+    operation_id="list_task_lists",
+    summary="List the user's task lists",
+    description=(
+        "Return every task list with its id and name. Only needed when the "
+        "user refers to a list other than their default one."
+    ),
+    dependencies=[Guarded],
+    tags=["Tasks"],
+)
+async def list_task_lists() -> dict[str, Any]:
+    return {"result": await tasks().list_task_lists()}

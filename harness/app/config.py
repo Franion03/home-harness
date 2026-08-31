@@ -26,6 +26,8 @@ class Settings:
     google_client_secret: str = field(default_factory=lambda: _env("GOOGLE_CLIENT_SECRET"))
     google_refresh_token: str = field(default_factory=lambda: _env("GOOGLE_REFRESH_TOKEN"))
     calendar_id: str = field(default_factory=lambda: _env("GOOGLE_CALENDAR_ID", "primary"))
+    # "@default" is the user's default task list; a real id also works.
+    tasklist_id: str = field(default_factory=lambda: _env("GOOGLE_TASKLIST_ID", "@default"))
 
     # -- This service
     api_key: str = field(default_factory=lambda: _env("TOOLS_API_KEY"))
@@ -34,6 +36,13 @@ class Settings:
     @property
     def ha_enabled(self) -> bool:
         return bool(self.ha_url and self.ha_token)
+
+    @property
+    def tasks_enabled(self) -> bool:
+        # Same OAuth grant as the calendar -- there is no separate credential.
+        # Whether the grant carries the tasks scope only shows up as a 403 at
+        # call time, so this cannot be checked here.
+        return self.calendar_enabled
 
     @property
     def calendar_enabled(self) -> bool:
@@ -47,6 +56,10 @@ class Settings:
             "google_calendar": {
                 "enabled": self.calendar_enabled,
                 "calendar_id": self.calendar_id,
+            },
+            "google_tasks": {
+                "enabled": self.tasks_enabled,
+                "tasklist_id": self.tasklist_id,
             },
             "timezone": self.timezone,
             "auth_required": bool(self.api_key),
