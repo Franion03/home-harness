@@ -27,6 +27,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 import tool_calendar
+import tool_health
 import tool_homeassistant
 import tool_tasks
 from config import Settings
@@ -46,6 +47,7 @@ class Services:
         self.ha: tool_homeassistant.HomeAssistant | None = None
         self.calendar: tool_calendar.Calendar | None = None
         self.tasks: tool_tasks.Tasks | None = None
+        self.health: tool_health.Health | None = None
         self.google_auth: GoogleAuth | None = None
 
         if self.settings.ha_enabled:
@@ -61,21 +63,38 @@ class Services:
             self.settings.google_client_secret,
             self.settings.google_refresh_token,
         )
+        # Calendar and Tasks share one grant, so they enable together; they
+        # are still separate blocks because a scope missing from the consent
+        # disables only one of them at call time.
         if self.settings.calendar_enabled:
             self.calendar = tool_calendar.Calendar(
                 self.google_auth, self.settings.calendar_id, self.settings.timezone
             )
             log.info("Google Calendar tools enabled (%s)", self.settings.calendar_id)
+        else:
+            log.warning(
+                "Google Calendar tools disabled — run scripts/google_oauth.py "
+                "for a refresh token"
+            )
+
         if self.settings.tasks_enabled:
             self.tasks = tool_tasks.Tasks(
                 self.google_auth, self.settings.tasklist_id, self.settings.timezone
             )
             log.info("Google Tasks tools enabled (%s)", self.settings.tasklist_id)
         else:
-            log.warning(
-                "Google Calendar tools disabled — run scripts/google_oauth.py "
-                "for a refresh token"
+            log.warning("Google Tasks tools disabled — no Google refresh token")
+
+        if self.settings.health_enabled:
+            self.health = tool_health.Health(
+                self.settings.influx_url,
+                self.settings.influx_token,
+                self.settings.influx_org,
+                self.settings.influx_bucket,
             )
+            log.info("Health tools enabled (%s)", self.settings.influx_url)
+        else:
+            log.warning("Health tools disabled — INFLUXDB_URL/INFLUXDB_TOKEN not set")
 
     async def aclose(self) -> None:
         if self.ha:
@@ -84,6 +103,8 @@ class Services:
             await self.calendar.aclose()
         if self.tasks:
             await self.tasks.aclose()
+        if self.health:
+            await self.health.aclose()
         if self.google_auth:
             await self.google_auth.aclose()
 
@@ -212,6 +233,17 @@ def tasks() -> tool_tasks.Tasks:
             503, "Google Tasks is not configured on this server (no refresh token)"
         )
     return t
+
+
+def health_tool() -> tool_health.Health:
+    # Not `health` -- that name is taken by the /health endpoint further down,
+    # which would shadow this accessor and yield a coroutine instead.
+    h = svc().health
+    if h is None:
+        raise HTTPException(
+            503, "Health metrics are not configured on this server (no InfluxDB)"
+        )
+    return h
 
 
 # ── health ───────────────────────────────────────────────────────────────
@@ -616,3 +648,68 @@ async def complete_task(
 )
 async def list_task_lists() -> dict[str, Any]:
     return {"result": await tasks().list_task_lists()}
+
+
+# ── Body metrics ─────────────────────────────────────────────────────────
+#
+# Read-only. Home Assistant writes to InfluxDB; this only queries it. The
+# entity ids depend on which Health Connect sensors the phone exposes, so
+# metric is matched as a case-insensitive pattern rather than an exact id.
+
+
+@app.get(
+    "/health-data/metrics",
+    operation_id="list_health_metrics",
+    summary="List which body metrics are being recorded",
+    description=(
+        "Return the health metrics that have data, with their entity id, unit "
+        "and how many readings exist. Call this first when the user asks about "
+        "their body data and you do not already know which metrics exist — the "
+        "ids depend on what their phone is syncing."
+    ),
+    dependencies=[Guarded],
+    tags=["Health"],
+)
+async def list_health_metrics(
+    days: Annotated[int, Query(
+        ge=1, le=3650, description="How far back to look for any reading at all.",
+    )] = 30,
+) -> dict[str, Any]:
+    return {"result": await health_tool().list_metrics(days=days)}
+
+
+@app.get(
+    "/health-data/metric",
+    operation_id="read_health_metric",
+    summary="Read the user's weight, heart rate, sleep or steps over time",
+    description=(
+        "Return a time series plus a summary (latest, min, max, average and the "
+        "change over the window) for one body metric. Use this for questions "
+        "about weight, sleep, heart rate or steps, and describe the trend from "
+        "the summary rather than recomputing it. If nothing matches, call "
+        "list_health_metrics to find the real names."
+    ),
+    dependencies=[Guarded],
+    tags=["Health"],
+)
+async def read_health_metric(
+    metric: Annotated[str, Query(
+        description="Case-insensitive substring of the entity id, for example "
+                    "'weight', 'sleep', 'heart_rate' or 'steps'.",
+    )],
+    days: Annotated[int, Query(
+        ge=1, le=3650, description="How many days back to read.",
+    )] = 30,
+    aggregate: Annotated[str, Query(
+        description="How to combine readings inside each bucket: mean, max, "
+                    "min, last or sum. Use sum for steps, mean for weight and "
+                    "heart rate, max for a nightly sleep total.",
+    )] = "mean",
+    every: Annotated[str, Query(
+        description="Bucket width, as a Flux duration such as '1d' or '1h'. "
+                    "Use '1d' for trends over weeks.",
+    )] = "1d",
+) -> dict[str, Any]:
+    return {"result": await health_tool().read_metric(
+        metric=metric, days=days, aggregate=aggregate, every=every
+    )}

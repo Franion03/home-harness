@@ -41,6 +41,7 @@ os.environ.update(
 
 import main  # noqa: E402
 import tool_calendar
+import tool_health
 import tool_tasks  # noqa: E402
 import tool_homeassistant  # noqa: E402
 from config import Settings  # noqa: E402
@@ -157,6 +158,30 @@ class FakeGoogle:
         raise AssertionError(f"no {method} request")
 
 
+class FakeInflux:
+    """InfluxDB's /api/v2/query, answering in the CSV dialect it really uses."""
+
+    HEADER = ",result,table,_start,_stop,_time,_value,_field,_measurement,entity_id"
+
+    def __init__(self):
+        self.requests: list[httpx.Request] = []
+        self.rows = [
+            ",_result,0,s,e,2026-08-25T00:00:00Z,82.4,value,kg,sensor.weight",
+            ",_result,0,s,e,2026-08-31T00:00:00Z,81.0,value,kg,sensor.weight",
+        ]
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        if request.url.path.endswith("/api/v2/query"):
+            body = "\r\n".join([self.HEADER, *self.rows]) + "\r\n"
+            return httpx.Response(200, text=body)
+        return httpx.Response(404, text="no stub")
+
+    @property
+    def last_flux(self) -> str:
+        return self.requests[-1].content.decode()
+
+
 class ToolServerTest(unittest.TestCase):
     """Boots the app with both upstreams stubbed."""
 
@@ -181,6 +206,11 @@ class ToolServerTest(unittest.TestCase):
         s.tasks = tool_tasks.Tasks(
             s.google_auth, "@default", "Europe/Madrid",
             transport=httpx.MockTransport(self.google.handler),
+        )
+        self.influx = FakeInflux()
+        s.health = tool_health.Health(
+            "http://influx.test:8086", "influx-token", "casa", "health",
+            transport=httpx.MockTransport(self.influx.handler),
         )
         main.services = s
         self.services = s
@@ -254,6 +284,7 @@ class TestOpenAPIContract(ToolServerTest):
                 "delete_calendar_event", "get_home_entity_state", "list_calendar_events",
                 "list_calendars", "list_home_entities", "update_calendar_event",
                 "add_task", "complete_task", "list_task_lists", "list_tasks",
+                "list_health_metrics", "read_health_metric",
             ]),
         )
 
@@ -455,6 +486,42 @@ class TestTaskTools(ToolServerTest):
         self.assertEqual(rows[0], {"id": "@default", "name": "My Tasks"})
 
 
+class TestHealthTools(ToolServerTest):
+    def test_reading_a_metric_summarises_the_trend(self):
+        out = json.loads(
+            self.client.get("/health-data/metric?metric=weight",
+                            headers=AUTH).json()["result"]
+        )
+        self.assertEqual(out["points"], 2)
+        self.assertEqual(out["latest"], 81.0)
+        self.assertEqual(out["max"], 82.4)
+        # The model should read the change, not recompute it from the series.
+        self.assertEqual(out["change"], -1.4)
+
+    def test_an_unknown_aggregate_falls_back_rather_than_breaking_flux(self):
+        # A model may invent an aggregate name; an unchecked one would be
+        # interpolated straight into the query and fail upstream.
+        self.client.get("/health-data/metric?metric=weight&aggregate=median",
+                        headers=AUTH)
+        self.assertIn("fn: mean", self.influx.last_flux)
+
+    def test_a_quote_in_the_pattern_cannot_escape_the_flux_literal(self):
+        self.client.get('/health-data/metric?metric=we"ight', headers=AUTH)
+        flux = self.influx.last_flux
+        self.assertIn(r'we\"ight', flux)
+
+    def test_no_data_is_reported_plainly_rather_than_as_an_error(self):
+        self.influx.rows = []
+        r = self.client.get("/health-data/metric?metric=weight", headers=AUTH)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("No readings matching", r.json()["result"])
+
+    def test_listing_metrics_reports_the_pipeline_being_empty(self):
+        self.influx.rows = []
+        out = self.client.get("/health-data/metrics", headers=AUTH).json()["result"]
+        self.assertIn("No health data", out)
+
+
 class TestDegradedConfiguration(unittest.TestCase):
     """A missing credential must be a clear 503, not a crash at import."""
 
@@ -476,13 +543,13 @@ class TestDegradedConfiguration(unittest.TestCase):
 
             # The spec must still list every tool, so Open WebUI's registration
             # does not silently lose half of them when a key is missing.
-            # 10 paths carry 13 operations: /calendar/events is GET+POST,
+            # 12 paths carry 15 operations: /calendar/events is GET+POST,
             # /calendar/events/{id} is PATCH+DELETE, and /tasks is GET+POST.
             spec = client.get("/openapi.json").json()
-            self.assertEqual(len(spec["paths"]), 10)
+            self.assertEqual(len(spec["paths"]), 12)
             ops = [m for i in spec["paths"].values() for m in i
                    if m in ("get", "post", "patch", "delete")]
-            self.assertEqual(len(ops), 13)
+            self.assertEqual(len(ops), 15)
         finally:
             main.services = None
 

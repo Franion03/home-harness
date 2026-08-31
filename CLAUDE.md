@@ -1,7 +1,7 @@
 # home-harness — notes for Claude
 
-An OpenAPI tool server: Home Assistant, Google Calendar and Google Tasks,
-for an LLM to call.
+An OpenAPI tool server: Home Assistant, Google Calendar, Google Tasks and
+body metrics, for an LLM to call.
 
 **Open WebUI is the assistant.** It owns the UI, sessions, auth, voice and
 model routing. This repo owns the house. Deployment for both lives in
@@ -42,6 +42,16 @@ unreadable, and the id becomes the tool name the model sees.
 - **Exception handlers in `main.py` convert upstream failures into legible
   messages** (503 unreachable, 502 with "the request was not applied"). The
   model reads these and recovers; a bare traceback teaches it nothing.
+- **Health data is read-only here.** Home Assistant writes it to InfluxDB;
+  this service only queries. `entity_id` is matched as a case-insensitive
+  pattern because the real ids depend on which Health Connect sensors the
+  phone exposes, which the server cannot know.
+- **The Flux query interpolates model-supplied text**, so the metric pattern
+  is escaped and the aggregate is checked against an allow-list. Do not
+  remove either — a stray quote would end the Flux string literal early.
+- **`health_tool()` is deliberately not named `health`** — that name belongs
+  to the `/health` endpoint, which would shadow the accessor and return a
+  coroutine.
 - **Tasks and Calendar share one OAuth grant.** Tasks needs no credential of
   its own, only the `auth/tasks` scope on the consent. A refresh token minted
   before that scope was added returns **403 on tasks while the calendar keeps
@@ -60,7 +70,7 @@ unreadable, and the id becomes the tool name the model sees.
 
 ## Tests
 
-`python harness/tests/test_harness.py` — 39 tests, upstreams stubbed with
+`python harness/tests/test_harness.py` — 44 tests, upstreams stubbed with
 `httpx.MockTransport`. No network, no credentials. Do not add real API keys to
 CI; nothing there needs them.
 

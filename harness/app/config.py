@@ -29,6 +29,12 @@ class Settings:
     # "@default" is the user's default task list; a real id also works.
     tasklist_id: str = field(default_factory=lambda: _env("GOOGLE_TASKLIST_ID", "@default"))
 
+    # -- Health metrics (read-only; Home Assistant does the writing)
+    influx_url: str = field(default_factory=lambda: _env("INFLUXDB_URL").rstrip("/"))
+    influx_token: str = field(default_factory=lambda: _env("INFLUXDB_TOKEN"))
+    influx_org: str = field(default_factory=lambda: _env("INFLUXDB_ORG", "casa"))
+    influx_bucket: str = field(default_factory=lambda: _env("INFLUXDB_BUCKET", "health"))
+
     # -- This service
     api_key: str = field(default_factory=lambda: _env("TOOLS_API_KEY"))
     timezone: str = field(default_factory=lambda: _env("TZ", "Europe/Madrid"))
@@ -36,6 +42,10 @@ class Settings:
     @property
     def ha_enabled(self) -> bool:
         return bool(self.ha_url and self.ha_token)
+
+    @property
+    def health_enabled(self) -> bool:
+        return bool(self.influx_url and self.influx_token)
 
     @property
     def tasks_enabled(self) -> bool:
@@ -60,6 +70,10 @@ class Settings:
             "google_tasks": {
                 "enabled": self.tasks_enabled,
                 "tasklist_id": self.tasklist_id,
+            },
+            "health": {
+                "enabled": self.health_enabled,
+                "bucket": self.influx_bucket if self.health_enabled else None,
             },
             "timezone": self.timezone,
             "auth_required": bool(self.api_key),
