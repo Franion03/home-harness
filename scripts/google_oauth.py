@@ -21,6 +21,7 @@ Only the standard library is used, so there is nothing to install.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import http.server
 import json
 import secrets
@@ -32,7 +33,7 @@ import urllib.request
 import webbrowser
 
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
-TOKEN_URL = "https://oauth2.googleapis.com/token"
+TOKEN_URL = "https://oauth2.googleapis.com/token"  # noqa: S105 - an endpoint, not a secret
 # Space-separated. Adding a scope invalidates nothing, but a refresh token
 # minted before the scope existed will NOT gain it -- consent must be run
 # again, and Google only re-issues a refresh token with prompt=consent.
@@ -48,7 +49,7 @@ done = threading.Event()
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self) -> None:  # noqa: N802 - http.server API
+    def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path != "/callback":
             self.send_error(404)
@@ -89,7 +90,9 @@ def exchange(client_id: str, client_secret: str, code: str) -> dict:
         data=payload,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    # S310 is suppressed below: the URL is the TOKEN_URL constant above, so the
+    # scheme is fixed and never caller-supplied.
+    with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
         return json.load(resp)
 
 
@@ -120,10 +123,9 @@ def main() -> int:
 
         print("\nOpen this URL and approve access:\n")
         print(f"  {auth_url}\n")
-        try:
+        # A headless machine has no browser; the URL is printed above either way.
+        with contextlib.suppress(Exception):
             webbrowser.open(auth_url)
-        except Exception:  # noqa: BLE001 - headless machines have no browser
-            pass
 
         print(f"Waiting for the redirect on {REDIRECT_URI} ...")
         if not done.wait(timeout=300):

@@ -1,36 +1,136 @@
 name: Build image
 
+# lint -> test -> build -> scan -> sign. The image is only pushed once the
+# quality gates pass; the scanners run against the image that was actually
+# built, by digest, so what is scanned is what ships.
+
 on:
   push:
     branches: [master, main]
     paths:
       - 'harness/**'
+      - 'scripts/**'
+      - 'pyproject.toml'
+      - '.github/workflows/build.yml'
+  pull_request:
+    paths:
+      - 'harness/**'
+      - 'scripts/**'
+      - 'pyproject.toml'
       - '.github/workflows/build.yml'
   workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
   IMAGE: ${{ github.repository }}
+  PYTHON_VERSION: '3.12'
+
+# A second push supersedes the first; there is no value in racing two builds
+# of the same branch to the same tag.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r harness/requirements-dev.txt
+      # Enforced: the repo is clean against these rules today.
+      - name: ruff check
+        run: ruff check --output-format=github .
+
+      # Advisory only. Adopting ruff's formatter would rewrite 657 lines of
+      # deliberately hand-laid-out code across 7 files for no behaviour change.
+      # Run `ruff format .` and drop continue-on-error if that trade is ever
+      # worth making — do it in a commit of its own.
+      - name: ruff format (advisory)
+        continue-on-error: true
+        run: ruff format --check --diff .
+
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-      - name: Install dependencies
-        run: pip install -r harness/requirements.txt
-      - name: Run tests
-        run: python harness/tests/test_harness.py
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r harness/requirements-dev.txt
 
+      # Upstreams are stubbed with httpx.MockTransport: no network, no
+      # credentials. The coverage floor lives in pyproject.toml.
+      - name: Run tests with coverage
+        run: pytest --cov --cov-report=term-missing --cov-report=xml
+
+      # Deliberately a one-liner, not a heredoc: a heredoc body inside a
+      # `run: |` block scalar terminates the scalar and makes the whole
+      # workflow file unparseable, which GitHub reports only as "workflow
+      # file issue" with no logs.
+      - name: Coverage summary
+        if: always()
+        run: >-
+          python -c "import xml.etree.ElementTree as ET;
+          r = ET.parse('coverage.xml').getroot();
+          print('## Coverage: %.1f%% lines, %.1f%% branches' % (float(r.get('line-rate', 0)) * 100, float(r.get('branch-rate', 0)) * 100))"
+          >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-xml
+          path: coverage.xml
+
+  # ---------------------------------------------------------------- security
+  # Warn-first: these do not block a merge yet. Remove `continue-on-error`
+  # once the findings each one reports have been cleared.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r harness/requirements-dev.txt
+
+      - name: pip-audit — known CVEs in the pinned dependencies
+        continue-on-error: true
+        run: pip-audit --requirement harness/requirements.txt --strict --desc
+
+  secrets-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # gitleaks scans history, not just the tip
+      - name: gitleaks
+        continue-on-error: true
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ------------------------------------------------------------------- build
   build:
-    needs: test
+    needs: [lint, test]
+    # A pull request gets the full gate but must not publish an image.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      id-token: write      # keyless cosign signing
+      attestations: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
 
@@ -50,7 +150,8 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      - uses: docker/build-push-action@v6
+      - id: push
+        uses: docker/build-push-action@v6
         with:
           context: harness
           push: true
@@ -58,3 +159,52 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Supply chain: an SBOM and SLSA provenance travel with the image.
+          sbom: true
+          provenance: mode=max
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign the image (keyless, via the workflow's OIDC identity)
+        run: cosign sign --yes "${REGISTRY}/${IMAGE}@${DIGEST}"
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+
+      # arr-stack pins by digest; print it so the deployment bump is a copy.
+      - name: Digest to pin in arr-stack
+        run: |
+          echo "## Deployed image" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${REGISTRY}/${IMAGE}@${{ steps.push.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  image-scan:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+    steps:
+      - name: Trivy — scan the image that was just pushed, by digest
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@0.29.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE }}@${{ needs.build.outputs.digest }}
+          format: sarif
+          output: trivy.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+
+      - name: Upload to the Security tab
+        if: always() && hashFiles('trivy.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+          category: trivy-image

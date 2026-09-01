@@ -1,0 +1,40 @@
+name: CodeQL
+
+# Real SAST, as opposed to the inline flake8-bandit (`S`) rules ruff runs in
+# the build workflow. Findings land in the repo's Security tab, not in the
+# build log, so this never blocks a merge on its own.
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  schedule:
+    # A dependency's CVE can land without anyone touching this repo.
+    - cron: '17 4 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      packages: read
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          # security-extended adds the lower-confidence queries; this codebase
+          # handles a Home Assistant token and can unlock doors, so the extra
+          # noise is worth it.
+          queries: security-extended
+
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:python

@@ -4,3 +4,12 @@ __pycache__/
 venv/
 .env
 *.db
+
+# Coverage output
+.coverage
+coverage.xml
+htmlcov/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/

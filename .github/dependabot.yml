@@ -1,0 +1,38 @@
+version: 2
+
+# Dependencies here are pinned exactly (requirements.txt) and the base image
+# is pinned by digest, which is the right posture but means nothing ever
+# updates on its own. These PRs are how the pins move.
+
+updates:
+  - package-ecosystem: pip
+    directory: /harness
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for the whole runtime stack: fastapi, uvicorn, httpx and
+      # pydantic move together and are tested together.
+      runtime:
+        patterns: ['fastapi', 'uvicorn*', 'httpx', 'pydantic*']
+      dev:
+        patterns: ['pytest*', 'ruff', 'pip-audit']
+    commit-message:
+      prefix: 'chore(deps)'
+
+  - package-ecosystem: docker
+    directory: /harness
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: 'chore(docker)'
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: 'chore(ci)'

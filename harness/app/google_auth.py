@@ -14,7 +14,7 @@ import httpx
 
 log = logging.getLogger("harness.google_auth")
 
-TOKEN_URL = "https://oauth2.googleapis.com/token"
+TOKEN_URL = "https://oauth2.googleapis.com/token"  # noqa: S105 - an endpoint, not a secret
 # Refresh a little early so a token never expires mid-request.
 EXPIRY_SKEW_SECONDS = 60
 

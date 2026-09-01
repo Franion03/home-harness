@@ -13,7 +13,6 @@ from typing import Any
 
 import httpx
 
-
 log = logging.getLogger("harness.tools.ha")
 
 # Domains worth exposing to an assistant. Everything else is reachable by

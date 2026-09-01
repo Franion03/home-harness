@@ -25,8 +25,8 @@ from pathlib import Path
 APP = Path(__file__).resolve().parents[1] / "app"
 sys.path.insert(0, str(APP))
 
-import httpx  # noqa: E402
-from fastapi.testclient import TestClient  # noqa: E402
+import httpx
+from fastapi.testclient import TestClient
 
 os.environ.update(
     HA_URL="http://ha.test:8123",
@@ -39,13 +39,13 @@ os.environ.update(
     TZ="Europe/Madrid",
 )
 
-import main  # noqa: E402
+import main
 import tool_calendar
 import tool_health
-import tool_tasks  # noqa: E402
-import tool_homeassistant  # noqa: E402
-from config import Settings  # noqa: E402
-from google_auth import GoogleAuth  # noqa: E402
+import tool_homeassistant
+import tool_tasks
+from config import Settings
+from google_auth import GoogleAuth
 
 AUTH = {"X-API-Key": "test-key"}
 
@@ -189,7 +189,7 @@ class ToolServerTest(unittest.TestCase):
         self.home = FakeHome()
         self.google = FakeGoogle()
 
-        s = Services = main.Services.__new__(main.Services)
+        s = main.Services.__new__(main.Services)
         s.settings = Settings()
         s.ha = tool_homeassistant.HomeAssistant(
             "http://ha.test:8123", "ha-token",

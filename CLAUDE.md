@@ -68,11 +68,29 @@ unreadable, and the id becomes the tool name the model sees.
 - **`call_service` accepts `data` as a dict or a JSON string.** FastAPI gives a
   dict; a hand-written call may give a string.
 
-## Tests
+## Tests and gates
 
-`python harness/tests/test_harness.py` — 44 tests, upstreams stubbed with
-`httpx.MockTransport`. No network, no credentials. Do not add real API keys to
-CI; nothing there needs them.
+```
+pip install -r harness/requirements-dev.txt
+pytest --cov          # 44 tests, coverage gate at 78%
+ruff check .          # must be clean
+```
+
+Upstreams are stubbed with `httpx.MockTransport`. No network, no credentials.
+Do not add real API keys to CI; nothing there needs them. The old
+`python harness/tests/test_harness.py` entry point still works.
+
+`fail_under` in `pyproject.toml` is a **ratchet**: raise it when coverage
+rises, never lower it to make a change pass — the same rule as the OpenAPI
+contract tests above.
+
+`ruff format` is **not** enforced. Adopting it would rewrite 657 lines of
+deliberately hand-laid-out code for no behaviour change; the check runs
+advisory-only in CI.
+
+CI also runs, advisory for now: pip-audit, gitleaks, CodeQL, and a Trivy scan
+of the pushed image by digest. The image carries an SBOM, SLSA provenance and
+a keyless cosign signature, and its base is pinned by digest.
 
 ## Cluster facts (defined in arr-stack, not here)
 

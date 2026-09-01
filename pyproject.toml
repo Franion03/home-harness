@@ -1,0 +1,61 @@
+# Tooling config for the tool server.
+#
+# There is no build system here on purpose: the image copies `harness/app/`
+# and runs uvicorn against it, so nothing is ever packaged or installed.
+# This file exists to configure ruff, pytest and coverage.
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["harness/app", "harness/tests", "scripts"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # import sorting
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "C4",   # comprehensions
+    "SIM",  # simplify
+    "S",    # flake8-bandit — inline SAST
+    "RUF",
+]
+ignore = [
+    # The upstream clients take a lot of arguments; splitting them into
+    # config objects would hide the OpenAPI field descriptions the model reads.
+    "B008",  # function call in argument default — this is how FastAPI Depends works
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The suite sets os.environ before importing the app, so its imports are
+# deliberately not at the top of the file (see the module docstring), and
+# assertions and fake credentials are the entire point of a test.
+"harness/tests/*" = ["E402", "S101", "S105", "S106"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["harness/tests"]
+# The app modules import each other flat (`import tool_calendar`), matching
+# the image layout where app/ is the working directory.
+pythonpath = ["harness/app"]
+addopts = "-q --strict-markers"
+
+[tool.coverage.run]
+source = ["harness/app"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+# Branch coverage was 79.5% across 44 tests when this gate was added (84% by
+# line, but branch is the honest number). 78 is a ratchet, not a target: raise
+# it when coverage rises, never lower it to make a change pass.
+fail_under = 78
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
