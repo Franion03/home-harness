@@ -2,10 +2,10 @@
 # which copies only requirements.txt.
 -r requirements.txt
 
-pytest==8.3.4
-pytest-cov==6.0.0
+pytest==9.1.1
+pytest-cov==7.1.0
 # Pinned to the version the repo was actually validated against. Ruff moves
 # which line an S-rule anchors to between releases, so a stale pin here means
 # CI flags a line the local run does not.
 ruff==0.16.5
-pip-audit==2.7.3
+pip-audit==2.10.1
