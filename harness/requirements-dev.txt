@@ -4,5 +4,8 @@
 
 pytest==8.3.4
 pytest-cov==6.0.0
-ruff==0.9.2
+# Pinned to the version the repo was actually validated against. Ruff moves
+# which line an S-rule anchors to between releases, so a stale pin here means
+# CI flags a line the local run does not.
+ruff==0.16.5
 pip-audit==2.7.3
