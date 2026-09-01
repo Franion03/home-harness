@@ -93,6 +93,10 @@ jobs:
   # Warn-first: these do not block a merge yet. Remove `continue-on-error`
   # once the findings each one reports have been cleared.
   audit:
+    # Advisory: a failure here must not block the pipeline. This has to be
+    # at JOB level -- continue-on-error on a step does not cover an action
+    # that fails to RESOLVE, which kills the job during setup.
+    continue-on-error: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -107,6 +111,10 @@ jobs:
         run: pip-audit --requirement harness/requirements.txt --strict --desc
 
   secrets-scan:
+    # Advisory: a failure here must not block the pipeline. This has to be
+    # at JOB level -- continue-on-error on a step does not cover an action
+    # that fails to RESOLVE, which kills the job during setup.
+    continue-on-error: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -194,6 +202,10 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
   image-scan:
+    # Advisory: a failure here must not block the pipeline. This has to be
+    # at JOB level -- continue-on-error on a step does not cover an action
+    # that fails to RESOLVE, which kills the job during setup.
+    continue-on-error: true
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -203,7 +215,7 @@ jobs:
     steps:
       - name: Trivy — scan the image that was just pushed, by digest
         continue-on-error: true
-        uses: aquasecurity/trivy-action@0.29.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.REGISTRY }}/${{ needs.build.outputs.image }}@${{ needs.build.outputs.digest }}
           format: sarif
