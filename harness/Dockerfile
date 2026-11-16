@@ -1,7 +1,7 @@
 # Pinned by digest, not by tag: `3.12-slim` is mutable, so an unpinned build
 # is not reproducible and a rebuild can silently change the base OS.
 # Dependabot moves this pin (see .github/dependabot.yml).
-FROM python:3.12-slim@sha256:e5c9fa26ffb76e11e0f054f30dc2523a2f9693f0c36c0cf1e39b27e152d899fc
+FROM python:3.15-slim@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928
 
 LABEL org.opencontainers.image.source="https://github.com/Franion03/home-harness" \
       org.opencontainers.image.description="OpenAPI tool server: Home Assistant, Google Calendar, Google Tasks, body metrics"
